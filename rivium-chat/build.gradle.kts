@@ -2,8 +2,10 @@ plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.serialization")
-    id("maven-publish")
+    id("com.vanniktech.maven.publish") version "0.30.0"
 }
+
+val sdkVersion = "0.1.0"
 
 android {
     namespace = "co.rivium.chat"
@@ -35,6 +37,46 @@ android {
     }
 }
 
+mavenPublishing {
+    publishToMavenCentral(
+        com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL,
+        automaticRelease = true
+    )
+    signAllPublications()
+
+    coordinates("co.rivium", "rivium-chat-android", sdkVersion)
+
+    pom {
+        name.set("Rivium Chat Android SDK")
+        description.set("Real-time messaging SDK for Android with WebSocket-based chat, read receipts, typing indicators, and presence.")
+        inceptionYear.set("2025")
+        url.set("https://rivium.co/cloud/rivium-chat")
+
+        licenses {
+            license {
+                name.set("MIT License")
+                url.set("https://opensource.org/licenses/MIT")
+                distribution.set("repo")
+            }
+        }
+
+        developers {
+            developer {
+                id.set("rivium")
+                name.set("Rivium")
+                email.set("founder@rivium.co")
+                url.set("https://rivium.co")
+            }
+        }
+
+        scm {
+            url.set("https://github.com/Rivium-co/rivium-chat-android-sdk")
+            connection.set("scm:git:git://github.com/Rivium-co/rivium-chat-android-sdk.git")
+            developerConnection.set("scm:git:ssh://git@github.com/Rivium-co/rivium-chat-android-sdk.git")
+        }
+    }
+}
+
 dependencies {
     // Kotlin
     implementation("org.jetbrains.kotlin:kotlin-stdlib:2.1.0")
@@ -53,18 +95,4 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
-}
-
-publishing {
-    publications {
-        register<MavenPublication>("release") {
-            groupId = "co.rivium"
-            artifactId = "rivium-chat-android"
-            version = "0.1.0"
-
-            afterEvaluate {
-                from(components["release"])
-            }
-        }
-    }
 }

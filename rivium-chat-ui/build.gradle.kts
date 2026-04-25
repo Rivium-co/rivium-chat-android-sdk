@@ -2,8 +2,10 @@ plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
-    id("maven-publish")
+    id("com.vanniktech.maven.publish") version "0.30.0"
 }
+
+val sdkVersion = "0.1.0"
 
 android {
     namespace = "co.rivium.chat.ui"
@@ -37,7 +39,46 @@ android {
     buildFeatures {
         compose = true
     }
+}
 
+mavenPublishing {
+    publishToMavenCentral(
+        com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL,
+        automaticRelease = true
+    )
+    signAllPublications()
+
+    coordinates("co.rivium", "rivium-chat-android-ui", sdkVersion)
+
+    pom {
+        name.set("Rivium Chat Android UI")
+        description.set("Pre-built Jetpack Compose UI components for RiviumChat Android SDK.")
+        inceptionYear.set("2025")
+        url.set("https://rivium.co/cloud/rivium-chat")
+
+        licenses {
+            license {
+                name.set("MIT License")
+                url.set("https://opensource.org/licenses/MIT")
+                distribution.set("repo")
+            }
+        }
+
+        developers {
+            developer {
+                id.set("rivium")
+                name.set("Rivium")
+                email.set("founder@rivium.co")
+                url.set("https://rivium.co")
+            }
+        }
+
+        scm {
+            url.set("https://github.com/Rivium-co/rivium-chat-android-sdk")
+            connection.set("scm:git:git://github.com/Rivium-co/rivium-chat-android-sdk.git")
+            developerConnection.set("scm:git:ssh://git@github.com/Rivium-co/rivium-chat-android-sdk.git")
+        }
+    }
 }
 
 dependencies {
@@ -78,18 +119,4 @@ dependencies {
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
-}
-
-publishing {
-    publications {
-        register<MavenPublication>("release") {
-            groupId = "co.rivium"
-            artifactId = "rivium-chat-android-ui"
-            version = "0.1.0"
-
-            afterEvaluate {
-                from(components["release"])
-            }
-        }
-    }
 }
