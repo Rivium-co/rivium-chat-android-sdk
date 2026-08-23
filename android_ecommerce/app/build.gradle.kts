@@ -58,7 +58,7 @@ dependencies {
     implementation("co.rivium:rivium-chat-android-ui:0.1.0")
 
     // Rivium Push SDK from Maven Central (for receiving push notifications when offline)
-    implementation("co.rivium:rivium-push-android:0.1.2")
+    implementation("co.rivium:rivium-push-android:0.1.10")
 
     // Android Core
     implementation("androidx.core:core-ktx:1.12.0")
