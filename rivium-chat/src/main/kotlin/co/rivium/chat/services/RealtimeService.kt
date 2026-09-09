@@ -45,6 +45,25 @@ class RealtimeService(
 
     private var client: Client? = null
     private val subscriptions = mutableMapOf<String, Subscription>()
+
+    /**
+     * Channels confirmed subscribed by the server. A channel in [subscriptions]
+     * but missing here was created and never confirmed — it must not be treated
+     * as usable, or a rejected subscribe leaves the room silently realtime-dead.
+     */
+    private val subscribedChannels = mutableSetOf<String>()
+
+    /**
+     * Guards [subscriptions] and [subscribedChannels].
+     *
+     * Subscribe and unsubscribe hand a channel name back and forth with
+     * Centrifuge's own registry. A screen that leaves a room and rejoins it
+     * across a lifecycle event drives both from different threads, and
+     * interleaving them leaves the two registries disagreeing — which surfaces
+     * as "Subscription to a channel already exists in client's internal
+     * registry".
+     */
+    private val channelLock = Any()
     private val pendingRoomSubscriptions = mutableListOf<String>()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -153,12 +172,84 @@ class RealtimeService(
     /**
      * Disconnect from the Centrifugo server.
      */
+    /**
+     * Tears one channel down.
+     *
+     * Centrifuge's registry is cleared **before** unsubscribing. The old order
+     * — drop our entry, unsubscribe, then free Centrifuge's — left a window
+     * where our map said the channel was free while Centrifuge still held the
+     * name, so a re-subscribe arriving in that window threw "already exists".
+     */
+    private fun teardownChannel(channel: String) {
+        synchronized(channelLock) {
+            val sub = subscriptions.remove(channel)
+            subscribedChannels.remove(channel)
+            if (sub != null) {
+                client?.removeSubscription(sub)
+                try {
+                    sub.unsubscribe()
+                } catch (_: Exception) {
+                    // Socket may already be gone; freeing the registry above is
+                    // the part that must not be skipped.
+                }
+            }
+        }
+    }
+
+    /**
+     * Returns true when the caller should build a new subscription for
+     * [channel]. A stale, never-confirmed subscription is torn down first —
+     * returning early on it is what made subscribeToRoom report success while
+     * the channel stayed dead.
+     */
+    private fun shouldSubscribe(channel: String): Boolean {
+        synchronized(channelLock) {
+            if (subscribedChannels.contains(channel)) return false
+            if (subscriptions.containsKey(channel)) {
+                teardownChannel(channel)
+            }
+            return true
+        }
+    }
+
+    /** Whether every channel of [roomId] is currently subscribed. */
+    fun isRoomSubscribed(roomId: String): Boolean = synchronized(channelLock) {
+        subscribedChannels.containsAll(
+            listOf("chat:room_$roomId", "presence:room_$roomId", "typing:room_$roomId")
+        )
+    }
+
+    /** Channels of [roomId] currently subscribed. */
+    fun subscribedChannelsFor(roomId: String): Set<String> = synchronized(channelLock) {
+        listOf("chat", "presence", "typing")
+            .map { "$it:room_$roomId" }
+            .filter { subscribedChannels.contains(it) }
+            .toSet()
+    }
+
     fun disconnect() {
-        subscriptions.values.forEach { it.unsubscribe() }
-        subscriptions.clear()
+        // Free Centrifuge's registry as well as our own map. Clearing only our
+        // map left every channel name held by the client, so each one threw
+        // "already exists" on the next subscribe for the life of the process.
+        synchronized(channelLock) {
+            subscriptions.keys.toList().forEach { teardownChannel(it) }
+            subscriptions.clear()
+            subscribedChannels.clear()
+        }
         client?.disconnect()
         client = null
         updateState(ConnectionState.DISCONNECTED)
+    }
+
+    /**
+     * Drops the current connection and opens a new one.
+     *
+     * [connect] returns early while a client object exists, leaving a host no
+     * way to recover a socket it believes is stale after a long background.
+     */
+    fun reconnect() {
+        disconnect()
+        connect()
     }
 
     /**
@@ -192,26 +283,16 @@ class RealtimeService(
      * Unsubscribe from a room's channels.
      */
     fun unsubscribeFromRoom(roomId: String) {
-        listOf("chat:room_$roomId", "typing:room_$roomId", "presence:room_$roomId").forEach { channel ->
-            val sub = subscriptions.remove(channel)
-            if (sub != null) {
-                sub.unsubscribe()
-                client?.removeSubscription(sub)
-            }
-        }
+        listOf("chat:room_$roomId", "typing:room_$roomId", "presence:room_$roomId")
+            .forEach { teardownChannel(it) }
     }
 
     /**
      * Leave presence and typing channels but keep chat channel for unread updates.
      */
     fun leaveRoom(roomId: String) {
-        listOf("typing:room_$roomId", "presence:room_$roomId").forEach { channel ->
-            val sub = subscriptions.remove(channel)
-            if (sub != null) {
-                sub.unsubscribe()
-                client?.removeSubscription(sub)
-            }
-        }
+        listOf("typing:room_$roomId", "presence:room_$roomId")
+            .forEach { teardownChannel(it) }
     }
 
     /**
@@ -273,7 +354,7 @@ class RealtimeService(
 
     private fun subscribeToChatChannel(client: Client, roomId: String) {
         val channel = "chat:room_$roomId"
-        if (subscriptions.containsKey(channel)) return
+        if (!shouldSubscribe(channel)) return
 
         val subscription = client.newSubscription(channel, object : SubscriptionEventListener() {
             override fun onPublication(sub: Subscription, event: PublicationEvent) {
@@ -293,6 +374,7 @@ class RealtimeService(
             }
 
             override fun onSubscribed(sub: Subscription, event: SubscribedEvent) {
+                synchronized(channelLock) { subscribedChannels.add(channel) }
                 scope.launch {
                     _subscriptionState.emit(
                         SubscriptionStateEvent(
@@ -310,6 +392,7 @@ class RealtimeService(
             }
 
             override fun onUnsubscribed(sub: Subscription, event: UnsubscribedEvent) {
+                synchronized(channelLock) { subscribedChannels.remove(channel) }
                 scope.launch {
                     _subscriptionState.emit(
                         SubscriptionStateEvent(
@@ -324,30 +407,40 @@ class RealtimeService(
             }
 
             override fun onError(sub: Subscription, event: SubscriptionErrorEvent) {
+                // Drop the dead subscription so the next subscribeToRoom builds
+                // a fresh one instead of short-circuiting on a stale entry.
+                synchronized(channelLock) {
+                    subscribedChannels.remove(channel)
+                    subscriptions.remove(channel)?.let { client?.removeSubscription(it) }
+                }
                 scope.launch {
                     _subscriptionState.emit(
                         SubscriptionStateEvent(
                             roomId = roomId,
                             channel = channel,
-                            status = SubscriptionStatus.UNSUBSCRIBED,
+                            status = SubscriptionStatus.ERROR,
                             reason = event.error.message
                         )
+                    )
+                    _connectionError.emit(
+                        ConnectionErrorEvent(error = "Subscription failed on $channel: ${event.error.message}")
                     )
                     _recoveryFailed.emit(roomId)
                 }
             }
         })
 
+        synchronized(channelLock) { subscriptions[channel] = subscription }
         subscription.subscribe()
-        subscriptions[channel] = subscription
     }
 
     private fun subscribeToPresenceChannel(client: Client, roomId: String) {
         val channel = "presence:room_$roomId"
-        if (subscriptions.containsKey(channel)) return
+        if (!shouldSubscribe(channel)) return
 
         val subscription = client.newSubscription(channel, object : SubscriptionEventListener() {
             override fun onSubscribed(sub: Subscription, event: SubscribedEvent) {
+                synchronized(channelLock) { subscribedChannels.add(channel) }
                 // Query current presence and emit events for all online users.
                 // This ensures we detect users who joined before we subscribed.
                 sub.presence { error, result ->
@@ -372,6 +465,34 @@ class RealtimeService(
                 }
             }
 
+
+            override fun onUnsubscribed(sub: Subscription, event: UnsubscribedEvent) {
+                synchronized(channelLock) { subscribedChannels.remove(channel) }
+            }
+
+            // Without this a rejected subscribe was invisible: the channel
+            // never went live, nothing was raised, and the room looked fine
+            // while presence/typing silently never arrived.
+            override fun onError(sub: Subscription, event: SubscriptionErrorEvent) {
+                synchronized(channelLock) {
+                    subscribedChannels.remove(channel)
+                    subscriptions.remove(channel)?.let { client?.removeSubscription(it) }
+                }
+                scope.launch {
+                    _subscriptionState.emit(
+                        SubscriptionStateEvent(
+                            roomId = roomId,
+                            channel = channel,
+                            status = SubscriptionStatus.ERROR,
+                            reason = event.error.message
+                        )
+                    )
+                    _connectionError.emit(
+                        ConnectionErrorEvent(error = "Subscription failed on $channel: ${event.error.message}")
+                    )
+                }
+            }
+
             override fun onLeave(sub: Subscription, event: LeaveEvent) {
                 val userId = event.info.user
                 if (userId.isNotEmpty()) {
@@ -382,22 +503,54 @@ class RealtimeService(
             }
         })
 
+        synchronized(channelLock) { subscriptions[channel] = subscription }
         subscription.subscribe()
-        subscriptions[channel] = subscription
     }
 
     private fun subscribeToTypingChannel(client: Client, roomId: String) {
         val channel = "typing:room_$roomId"
-        if (subscriptions.containsKey(channel)) return
+        if (!shouldSubscribe(channel)) return
 
         val subscription = client.newSubscription(channel, object : SubscriptionEventListener() {
             override fun onPublication(sub: Subscription, event: PublicationEvent) {
                 handleTypingPublication(roomId, event.data)
             }
+
+            override fun onSubscribed(sub: Subscription, event: SubscribedEvent) {
+                synchronized(channelLock) { subscribedChannels.add(channel) }
+            }
+
+            override fun onUnsubscribed(sub: Subscription, event: UnsubscribedEvent) {
+                synchronized(channelLock) { subscribedChannels.remove(channel) }
+            }
+
+            // Without this a rejected subscribe was invisible: the channel
+            // never went live, nothing was raised, and the room looked fine
+            // while presence/typing silently never arrived.
+            override fun onError(sub: Subscription, event: SubscriptionErrorEvent) {
+                synchronized(channelLock) {
+                    subscribedChannels.remove(channel)
+                    subscriptions.remove(channel)?.let { client?.removeSubscription(it) }
+                }
+                scope.launch {
+                    _subscriptionState.emit(
+                        SubscriptionStateEvent(
+                            roomId = roomId,
+                            channel = channel,
+                            status = SubscriptionStatus.ERROR,
+                            reason = event.error.message
+                        )
+                    )
+                    _connectionError.emit(
+                        ConnectionErrorEvent(error = "Subscription failed on $channel: ${event.error.message}")
+                    )
+                }
+            }
+
         })
 
+        synchronized(channelLock) { subscriptions[channel] = subscription }
         subscription.subscribe()
-        subscriptions[channel] = subscription
     }
 
     private fun handleChatPublication(roomId: String, data: ByteArray) {

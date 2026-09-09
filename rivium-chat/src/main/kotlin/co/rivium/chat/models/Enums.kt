@@ -38,5 +38,8 @@ enum class ConnectionState {
 enum class SubscriptionStatus {
     SUBSCRIBING,
     SUBSCRIBED,
-    UNSUBSCRIBED
+    UNSUBSCRIBED,
+
+    /** The server rejected the subscribe, or it failed in transit. */
+    ERROR
 }
