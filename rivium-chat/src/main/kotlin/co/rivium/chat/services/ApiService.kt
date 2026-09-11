@@ -4,10 +4,15 @@ import co.rivium.chat.RiviumChatConfig
 import co.rivium.chat.models.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import co.rivium.chat.events.AuthErrorEvent
+import kotlinx.coroutines.runBlocking
+import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import java.io.IOException
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
@@ -15,7 +20,12 @@ import java.util.concurrent.TimeUnit
 /**
  * HTTP API service for RiviumChat backend.
  */
-class ApiService(private val config: RiviumChatConfig) {
+class ApiService(
+    private val config: RiviumChatConfig,
+    private val onAuthError: ((AuthErrorEvent) -> Unit)? = null
+) {
+
+    private val tokens: TokenManager? = config.tokenProvider?.let { TokenManager(it) }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -28,9 +38,75 @@ class ApiService(private val config: RiviumChatConfig) {
                 .build()
             chain.proceed(request)
         }
+        .addInterceptor(userTokenInterceptor())
         .build()
 
+    /**
+     * Adds the user token and handles its expiry, so callers never see a token
+     * error they could not act on. Calls run on OkHttp's blocking call thread,
+     * hence `runBlocking` around the app's suspending provider.
+     */
+    private fun userTokenInterceptor() = Interceptor { chain ->
+        val manager = tokens ?: return@Interceptor chain.proceed(chain.request())
+
+        val first = try {
+            runBlocking { manager.get() }
+        } catch (e: Exception) {
+            reportAuthError("token_provider_failed", "tokenProvider failed", e)
+            throw IOException("RiviumChat: tokenProvider failed", e)
+        }
+        var response = chain.proceed(chain.request().newBuilder().header(USER_TOKEN_HEADER, first).build())
+
+        // An expired token is routine: fetch a new one and replay the request
+        // once. The user never sees it.
+        if (response.code == 401 && authErrorCode(response) == "token_expired") {
+            val fresh = try {
+                runBlocking { manager.refresh() }
+            } catch (e: Exception) {
+                reportAuthError("token_provider_failed", "tokenProvider failed", e)
+                throw IOException("RiviumChat: tokenProvider failed", e)
+            }
+            response.close()
+            response = chain.proceed(chain.request().newBuilder().header(USER_TOKEN_HEADER, fresh).build())
+        }
+
+        if (response.code == 401) {
+            val code = authErrorCode(response)
+            if (code != null) reportAuthError(code, authErrorMessage(response), null)
+        }
+        response
+    }
+
+    /** The identity error code (`token_*`) of a 401 body, if any. */
+    private fun authErrorCode(response: Response): String? = try {
+        val code = JSONObject(response.peekBody(PEEK_LIMIT).string()).optString("code")
+        if (code.startsWith("token_")) code else null
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun authErrorMessage(response: Response): String = try {
+        JSONObject(response.peekBody(PEEK_LIMIT).string()).optString("message", "Authentication failed")
+    } catch (e: Exception) {
+        "Authentication failed"
+    }
+
+    private fun reportAuthError(code: String, message: String, error: Throwable?) {
+        onAuthError?.invoke(AuthErrorEvent(code, message, error))
+    }
+
+    /** Forgets the cached user token (e.g. on logout). */
+    fun clearUserToken() = tokens?.clear()
+
+    /** A user token for the realtime connection, when a tokenProvider is set. */
+    internal suspend fun userTokenOrNull(): String? = tokens?.get()
+
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+
+    private companion object {
+        const val USER_TOKEN_HEADER = "x-user-token"
+        const val PEEK_LIMIT = 4096L
+    }
 
     // ─── Room Operations ─────────────────────────────────────────────────
 

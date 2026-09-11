@@ -5,7 +5,7 @@ plugins {
     id("com.vanniktech.maven.publish") version "0.30.0"
 }
 
-val sdkVersion = "0.1.1"
+val sdkVersion = "0.1.2"
 
 android {
     namespace = "co.rivium.chat"
@@ -93,6 +93,8 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
+    // Android ships a stub org.json for JVM unit tests; this is the real one.
+    testImplementation("org.json:json:20231013")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
 }

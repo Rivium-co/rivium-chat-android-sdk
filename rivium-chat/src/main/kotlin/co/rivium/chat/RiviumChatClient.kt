@@ -4,7 +4,10 @@ import co.rivium.chat.events.*
 import co.rivium.chat.models.*
 import co.rivium.chat.services.ApiService
 import co.rivium.chat.services.RealtimeService
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.runBlocking
 
 /**
  * Main entry point for the RiviumChat SDK.
@@ -31,10 +34,24 @@ import kotlinx.coroutines.flow.SharedFlow
  */
 class RiviumChatClient(val config: RiviumChatConfig) {
 
-    private val apiService = ApiService(config)
+    private val _authErrors = MutableSharedFlow<AuthErrorEvent>(extraBufferCapacity = 10)
+
+    /**
+     * Identity errors a token refresh cannot fix (revoked or invalid token,
+     * project requires a token, tokenProvider failing). Send the user to
+     * login. Only emitted when [RiviumChatConfig.tokenProvider] is set.
+     */
+    val onAuthError: SharedFlow<AuthErrorEvent> = _authErrors.asSharedFlow()
+
+    private val apiService = ApiService(config) { _authErrors.tryEmit(it) }
     private val realtimeService = RealtimeService(
         config,
-        { apiService.getCentrifugoToken(config.userId, info = config.userInfo?.mapValues { it.value as Any }) }
+        {
+            // With a tokenProvider the same user token authenticates REST and
+            // the realtime connection; centrifuge asks again before it expires.
+            runBlocking { apiService.userTokenOrNull() }
+                ?: apiService.getCentrifugoToken(config.userId, info = config.userInfo?.mapValues { it.value as Any })
+        }
     )
 
     private var isDisposed = false
@@ -340,6 +357,7 @@ class RiviumChatClient(val config: RiviumChatConfig) {
         if (isDisposed) return
         isDisposed = true
         realtimeService.dispose()
+        apiService.clearUserToken()
         apiService.dispose()
     }
 }

@@ -93,3 +93,18 @@ data class SubscriptionStateEvent(
     val code: Int? = null,
     val reason: String? = null
 )
+
+/**
+ * The server refused the user's identity and a token refresh cannot fix it:
+ * the token was revoked or invalid, the project requires a token, or the
+ * app's tokenProvider failed. Typically: send the user to login.
+ *
+ * [code] is the server's reason (`token_revoked`, `token_invalid`,
+ * `token_required`, `token_expired` after a failed refresh) or
+ * `token_provider_failed`.
+ */
+data class AuthErrorEvent(
+    val code: String,
+    val message: String,
+    val error: Throwable? = null
+)

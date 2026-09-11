@@ -47,6 +47,35 @@ val client = RiviumChatClient(config)
 client.connect()
 ```
 
+### Secure user identity (recommended)
+
+Your API key ships inside the app, so on its own it cannot prove who the user
+is. Add a `tokenProvider` that asks **your server** for a user token:
+
+```kotlin
+val config = RiviumChatConfig(
+    apiKey = "your_api_key",
+    userId = "user-123",
+    tokenProvider = { myBackend.getChatToken() }  // suspend fun returning the token
+)
+
+// Revoked or invalid token — send the user to login.
+scope.launch { client.onAuthError.collect { signOut() } }
+```
+
+Your server mints it with the server secret (never put the secret in the app):
+
+```http
+POST https://chat.rivium.co/api/v1/users/token
+x-api-key: your_api_key
+x-server-secret: your_server_secret
+
+{ "userId": "user-123" }
+```
+
+Tokens last 1 hour. The SDK refreshes them before they expire and retries a
+request once if the server reports an expired token, so users never notice.
+
 ### 2. Create or Join a Room
 
 ```kotlin
