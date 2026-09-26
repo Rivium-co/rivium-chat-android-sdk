@@ -5,7 +5,7 @@ plugins {
     id("com.vanniktech.maven.publish") version "0.30.0"
 }
 
-val sdkVersion = "0.1.2"
+val sdkVersion = "0.1.3"
 
 android {
     namespace = "co.rivium.chat"
