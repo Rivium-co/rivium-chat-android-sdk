@@ -60,5 +60,11 @@ data class RiviumChatConfig(
 
         /** WebSocket URL for Centrifugo realtime server. */
         const val CENTRIFUGO_URL = "wss://ws-chat.rivium.co/connection/websocket"
+
+        /** Name this SDK reports to the API. */
+        const val SDK_NAME = "android"
+
+        /** Version of this SDK. */
+        const val SDK_VERSION = BuildConfig.SDK_VERSION
     }
 }

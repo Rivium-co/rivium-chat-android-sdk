@@ -5,7 +5,7 @@ plugins {
     id("com.vanniktech.maven.publish") version "0.30.0"
 }
 
-val sdkVersion = "0.1.3"
+val sdkVersion = "0.1.4"
 
 android {
     namespace = "co.rivium.chat"
@@ -15,6 +15,13 @@ android {
         minSdk = 21
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
+
+        // SDK version at runtime (RiviumChatConfig.SDK_VERSION, X-Rivium-SDK header).
+        buildConfigField("String", "SDK_VERSION", "\"$sdkVersion\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {

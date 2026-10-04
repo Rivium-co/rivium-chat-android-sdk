@@ -31,13 +31,7 @@ class ApiService(
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
-        .addInterceptor { chain ->
-            val request = chain.request().newBuilder()
-                .addHeader("x-api-key", config.apiKey)
-                .addHeader("Content-Type", "application/json")
-                .build()
-            chain.proceed(request)
-        }
+        .addInterceptor(defaultHeadersInterceptor(config.apiKey))
         .addInterceptor(userTokenInterceptor())
         .build()
 
@@ -103,9 +97,25 @@ class ApiService(
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
-    private companion object {
-        const val USER_TOKEN_HEADER = "x-user-token"
-        const val PEEK_LIMIT = 4096L
+    internal companion object {
+        private const val USER_TOKEN_HEADER = "x-user-token"
+        private const val PEEK_LIMIT = 4096L
+
+        /** Header that tells the API which SDK and version made a request. */
+        const val SDK_HEADER = "X-Rivium-SDK"
+
+        /** Its value: `android/<version>`. */
+        const val SDK_HEADER_VALUE = "${RiviumChatConfig.SDK_NAME}/${RiviumChatConfig.SDK_VERSION}"
+
+        /** The headers every request carries. */
+        fun defaultHeadersInterceptor(apiKey: String) = Interceptor { chain ->
+            val request = chain.request().newBuilder()
+                .addHeader("x-api-key", apiKey)
+                .addHeader("Content-Type", "application/json")
+                .addHeader(SDK_HEADER, SDK_HEADER_VALUE)
+                .build()
+            chain.proceed(request)
+        }
     }
 
     // ─── Room Operations ─────────────────────────────────────────────────
