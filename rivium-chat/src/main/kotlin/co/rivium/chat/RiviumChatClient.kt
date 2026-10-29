@@ -68,9 +68,9 @@ class RiviumChatClient internal constructor(
         config,
         {
             // With a tokenProvider the same user token authenticates REST and
-            // the realtime connection; centrifuge asks again before it expires.
+            // the realtime connection; the realtime client asks again before it expires.
             runBlocking { apiService.userTokenOrNull() }
-                ?: apiService.getCentrifugoToken(config.userId, info = config.userInfo?.mapValues { it.value as Any })
+                ?: apiService.getRealtimeToken(config.userId, info = config.userInfo?.mapValues { it.value as Any })
         }
     )
 

@@ -95,7 +95,7 @@ dependencies {
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
     implementation("com.squareup.retrofit2:converter-gson:2.9.0")
 
-    // Centrifuge (WebSocket client for Centrifugo)
+    // Realtime WebSocket client
     implementation("io.github.centrifugal:centrifuge-java:0.3.0")
 
     // Testing

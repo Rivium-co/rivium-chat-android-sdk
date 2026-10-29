@@ -694,30 +694,36 @@ class ApiService internal constructor(
         }
     }
 
-    // ─── Centrifugo Token ──────────────────────────────────────────────────
+    // ─── Realtime Token ────────────────────────────────────────────────────
 
     /**
-     * Get a Centrifugo connection token from the server.
+     * Get a realtime connection token from the server.
      */
-    fun getCentrifugoToken(userId: String, info: Map<String, Any>? = null): String {
+    fun getRealtimeToken(userId: String, info: Map<String, Any>? = null): String {
         val body = JSONObject().apply {
             put("userId", userId)
             info?.let { put("info", JSONObject(it)) }
         }
 
         val request = Request.Builder()
+            // Chat API route that issues the realtime connection token.
             .url(apiUrl("centrifugo", "token"))
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
 
         val response = client.newCall(request).execute()
         if (!response.isSuccessful) {
-            throw RiviumChatException("Failed to get Centrifugo token: ${response.code}")
+            throw RiviumChatException("Failed to get realtime token: ${response.code}")
         }
 
         val json = JSONObject(response.body!!.string())
         return json.getString("token")
     }
+
+    /** Get a realtime connection token from the server. */
+    @Deprecated("Use getRealtimeToken", ReplaceWith("getRealtimeToken(userId, info)"))
+    fun getCentrifugoToken(userId: String, info: Map<String, Any>? = null): String =
+        getRealtimeToken(userId, info)
 
     // ─── Helper Methods ──────────────────────────────────────────────────
 

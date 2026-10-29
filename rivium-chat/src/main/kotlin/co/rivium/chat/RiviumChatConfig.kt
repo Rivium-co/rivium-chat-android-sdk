@@ -73,8 +73,12 @@ data class RiviumChatConfig(
         /** Base URL for the RiviumChat API. */
         const val BASE_URL = "https://chat.rivium.co"
 
-        /** WebSocket URL for Centrifugo realtime server. */
-        const val CENTRIFUGO_URL = "wss://ws-chat.rivium.co/connection/websocket"
+        /** WebSocket URL for the realtime server. */
+        const val REALTIME_URL = "wss://ws-chat.rivium.co/connection/websocket"
+
+        /** WebSocket URL for the realtime server. */
+        @Deprecated("Use REALTIME_URL", ReplaceWith("REALTIME_URL"))
+        const val CENTRIFUGO_URL = REALTIME_URL
 
         /** Name this SDK reports to the API. */
         const val SDK_NAME = "android"

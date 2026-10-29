@@ -19,7 +19,7 @@ class RealtimeServiceTest {
 
     private class Answer(val error: Throwable?, val token: String?)
 
-    /** Asks the service's token getter once, as Centrifuge does on expiry. */
+    /** Asks the service's token getter once, as the realtime client does on expiry. */
     private fun ask(service: RealtimeService): Answer {
         val latch = CountDownLatch(1)
         var answer: Answer? = null
@@ -42,7 +42,7 @@ class RealtimeServiceTest {
     }
 
     @Test
-    fun `token getter hands a failure back to Centrifuge`() {
+    fun `token getter hands a failure back to the realtime client`() {
         val service = RealtimeService(config) { throw IllegalStateException("offline") }
 
         val answer = ask(service)

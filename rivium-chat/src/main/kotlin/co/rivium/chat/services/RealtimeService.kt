@@ -44,7 +44,7 @@ import kotlin.coroutines.resume
 import java.time.Instant
 
 /**
- * Realtime service for RiviumChat using Centrifugo.
+ * Realtime service for RiviumChat.
  * Handles WebSocket connections, subscriptions, and event streaming.
  */
 class RealtimeService(
@@ -54,7 +54,7 @@ class RealtimeService(
 
     private var client: Client? = null
 
-    /** Whether a Centrifuge client (a socket) exists. */
+    /** Whether a realtime client (a socket) exists. */
     internal val hasClient: Boolean get() = client != null
     private val subscriptions = mutableMapOf<String, Subscription>()
 
@@ -69,7 +69,7 @@ class RealtimeService(
      * Guards [subscriptions] and [subscribedChannels].
      *
      * Subscribe and unsubscribe hand a channel name back and forth with
-     * Centrifuge's own registry. A screen that leaves a room and rejoins it
+     * the realtime client's own registry. A screen that leaves a room and rejoins it
      * across a lifecycle event drives both from different threads, and
      * interleaving them leaves the two registries disagreeing — which surfaces
      * as "Subscription to a channel already exists in client's internal
@@ -146,7 +146,7 @@ class RealtimeService(
     }
 
     /**
-     * Connect to the Centrifugo server.
+     * Connect to the realtime server.
      */
     fun connect() {
         if (client != null || disposed) return
@@ -165,7 +165,7 @@ class RealtimeService(
                 // long-lived connection survives token expiry.
                 options.tokenGetter = connectionTokenGetter()
 
-                val centrifugeClient = Client(RiviumChatConfig.CENTRIFUGO_URL, options, object : EventListener() {
+                val realtimeClient = Client(RiviumChatConfig.REALTIME_URL, options, object : EventListener() {
                     override fun onConnecting(client: Client, event: ConnectingEvent) {
                         updateState(ConnectionState.CONNECTING)
                     }
@@ -197,9 +197,9 @@ class RealtimeService(
 
                 synchronized(channelLock) {
                     if (attempt != generation || client != null) return@launch
-                    client = centrifugeClient
+                    client = realtimeClient
                 }
-                centrifugeClient.connect()
+                realtimeClient.connect()
             } catch (e: Exception) {
                 // No connection without a token (unknown key, token required,
                 // API unreachable, tokenProvider failed): report it.
@@ -212,7 +212,7 @@ class RealtimeService(
 
     /**
      * Fetches a fresh connection token from the same source as the first one,
-     * off Centrifuge's own thread. A failure is handed back to Centrifuge,
+     * off the realtime client's own thread. A failure is handed back to the client,
      * which reports it and retries.
      */
     internal fun connectionTokenGetter(): ConnectionTokenGetter = object : ConnectionTokenGetter() {
@@ -234,9 +234,9 @@ class RealtimeService(
     /**
      * Tears one channel down.
      *
-     * Centrifuge's registry is cleared **before** unsubscribing. The old order
-     * — drop our entry, unsubscribe, then free Centrifuge's — left a window
-     * where our map said the channel was free while Centrifuge still held the
+     * The realtime client's registry is cleared **before** unsubscribing. The
+     * old order — drop our entry, unsubscribe, then free the client's — left a
+     * window where our map said the channel was free while the client still held the
      * name, so a re-subscribe arriving in that window threw "already exists".
      */
     private fun teardownChannel(channel: String) {
@@ -288,7 +288,7 @@ class RealtimeService(
 
     fun disconnect() {
         generation++
-        // Free Centrifuge's registry as well as our own map. Clearing only our
+        // Free the realtime client's registry as well as our own map. Clearing only our
         // map left every channel name held by the client, so each one threw
         // "already exists" on the next subscribe for the life of the process.
         synchronized(channelLock) {
@@ -356,7 +356,7 @@ class RealtimeService(
     }
 
     /**
-     * Gets currently online users in a room via Centrifugo presence.
+     * Gets currently online users in a room via realtime presence.
      *
      * Suspends instead of blocking the calling thread; gives up after 5
      * seconds with an empty set, as before.
