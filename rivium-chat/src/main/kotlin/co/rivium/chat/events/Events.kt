@@ -108,3 +108,37 @@ data class AuthErrorEvent(
     val message: String,
     val error: Throwable? = null
 )
+
+/**
+ * A message queued while offline was stored by the server
+ * (only with `queueOfflineMessages`).
+ *
+ * [localId] is the pending message's id (`local_<clientMessageId>`);
+ * [message] is the stored message. The live message event for it still
+ * arrives and carries the same [clientMessageId].
+ */
+data class MessageSentEvent(
+    val localId: String,
+    val clientMessageId: String,
+    val message: Message
+)
+
+/**
+ * A message queued while offline left the queue without being stored
+ * (only with `queueOfflineMessages`).
+ *
+ * [reason] is [REASON_EXPIRED] (it waited more than 24 hours) or
+ * [REASON_REJECTED] (the server refused it, e.g. not a member any more).
+ */
+data class MessageFailedEvent(
+    val localId: String,
+    val clientMessageId: String,
+    val roomId: String,
+    val error: String,
+    val reason: String
+) {
+    companion object {
+        const val REASON_EXPIRED = "expired"
+        const val REASON_REJECTED = "rejected"
+    }
+}

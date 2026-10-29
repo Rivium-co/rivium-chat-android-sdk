@@ -80,7 +80,8 @@ fun ChatInputField(
     onVoiceRecordStart: (() -> Unit)? = null,
     enabled: Boolean = true,
     placeholder: String = "Type a message...",
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    replyingToName: String? = null
 ) {
     var textFieldValue by remember { mutableStateOf(TextFieldValue()) }
     val focusRequester = remember { FocusRequester() }
@@ -104,6 +105,7 @@ fun ChatInputField(
             replyingTo?.let { message ->
                 ReplyInputPreview(
                     message = message,
+                    senderName = replyingToName ?: message.senderUserId,
                     onCancel = { onCancelReply?.invoke() }
                 )
             }
@@ -260,6 +262,7 @@ fun ChatInputField(
 @Composable
 private fun ReplyInputPreview(
     message: Message,
+    senderName: String,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -288,7 +291,7 @@ private fun ReplyInputPreview(
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Replying to ${message.senderUserId}",
+                    text = "Replying to $senderName",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary
                 )

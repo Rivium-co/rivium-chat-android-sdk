@@ -6,6 +6,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -54,6 +55,15 @@ class ChatChannelState(
     private val _onlineUsers = mutableStateListOf<String>()
     val onlineUsers: SnapshotStateList<String> = _onlineUsers
 
+    // Participants' display names (user id -> name), from the room
+    private val _participantDisplayNames = mutableStateMapOf<String, String>()
+
+    /** Display names of the room's participants, by user id. */
+    val participantDisplayNames: Map<String, String> get() = _participantDisplayNames
+
+    /** The participant's display name, or their user id when they have none. */
+    fun displayNameFor(userId: String): String = _participantDisplayNames[userId] ?: userId
+
     // Other user's last read timestamp (for read receipts)
     var otherUserLastRead: Instant? by mutableStateOf(null)
         private set
@@ -86,6 +96,7 @@ class ChatChannelState(
             _messages.clear()
             _messages.addAll(result.messages.reversed()) // Newest first
             hasMore = result.hasMore
+            showQueuedMessages()
 
             // Get initial presence
             try {
@@ -99,6 +110,11 @@ class ChatChannelState(
             // Load initial read state from room participants
             try {
                 val room = client.getRoom(roomId)
+                room.participants.forEach { participant ->
+                    participant.displayName?.takeIf { it.isNotBlank() }?.let {
+                        _participantDisplayNames[participant.externalUserId] = it
+                    }
+                }
                 val otherParticipant = room.participants.firstOrNull {
                     it.externalUserId != currentUserId
                 }
@@ -136,6 +152,7 @@ class ChatChannelState(
             _messages.clear()
             _messages.addAll(result.messages.reversed()) // Newest first
             hasMore = result.hasMore
+            showQueuedMessages()
         } catch (e: Exception) {
             error = e
         } finally {
@@ -218,6 +235,25 @@ class ChatChannelState(
                 replyToId = effectiveReplyToId
             )
 
+            if (sentMessage.isPending) {
+                // Queued by the offline outbox: shown as "Waiting for network…"
+                // until onMessageSent / onMessageFailed.
+                val index = _messages.indexOfFirst { it.id == pendingId }
+                if (index >= 0) _messages[index] = sentMessage else _messages.add(0, sentMessage)
+                return
+            }
+
+            // The live event may already show it (matched by clientMessageId): never twice.
+            val shownIndex = sentMessage.clientMessageId?.let { cmid ->
+                _messages.indexOfFirst { it.id != pendingId && !it.isPending && it.clientMessageId == cmid }
+            } ?: -1
+            if (shownIndex >= 0) {
+                _messages.removeAll { it.id == pendingId }
+                val again = _messages.indexOfFirst { it.clientMessageId == sentMessage.clientMessageId && !it.isPending }
+                if (again >= 0) _messages[again] = sentMessage
+                return
+            }
+
             // Replace pending message with real one
             val index = _messages.indexOfFirst { it.id == pendingId }
             if (index >= 0) {
@@ -237,6 +273,26 @@ class ChatChannelState(
             }
         }
     }
+
+    /** Shows messages the offline outbox still holds for this room (e.g. after a restart). */
+    private fun showQueuedMessages() {
+        val queued = try {
+            client.getPendingMessages(roomId)
+        } catch (e: Exception) {
+            emptyList()
+        }
+        queued.forEach { pending ->
+            if (_messages.none { it.id == pending.id || it.clientMessageId == pending.clientMessageId }) {
+                _messages.add(0, pending) // oldest first in, so the newest ends on top
+            }
+        }
+    }
+
+    /**
+     * A queued message was stored: replace its "Waiting for network…" copy,
+     * or drop the copy when the live event already showed the message.
+     */
+    private fun applySent(localId: String, message: Message) = mergeSentMessage(_messages, localId, message)
 
     /**
      * Retry sending a failed message.
@@ -273,8 +329,16 @@ class ChatChannelState(
      */
     suspend fun editMessage(messageId: String, content: String) {
         try {
-            client.editMessage(messageId, content)
-            // Message will be updated via event stream
+            val edited = client.editMessage(messageId, content)
+            // Show the edit right away; the realtime event confirms it again.
+            val index = _messages.indexOfFirst { it.id == messageId }
+            if (index >= 0) {
+                _messages[index] = _messages[index].copy(
+                    content = edited.content,
+                    isEdited = true,
+                    editedAt = edited.editedAt ?: _messages[index].editedAt
+                )
+            }
         } catch (e: Exception) {
             error = e
         }
@@ -308,6 +372,8 @@ class ChatChannelState(
     suspend fun pinMessage(messageId: String) {
         try {
             client.pinMessage(messageId)
+            // Show it pinned right away; the realtime event confirms it again.
+            setPinned(messageId, true)
         } catch (e: Exception) {
             error = e
         }
@@ -319,9 +385,20 @@ class ChatChannelState(
     suspend fun unpinMessage(messageId: String) {
         try {
             client.unpinMessage(messageId)
+            setPinned(messageId, false)
         } catch (e: Exception) {
             error = e
         }
+    }
+
+    private fun setPinned(messageId: String, pinned: Boolean) {
+        val index = _messages.indexOfFirst { it.id == messageId }
+        if (index < 0 || _messages[index].isPinned == pinned) return
+        _messages[index] = _messages[index].copy(
+            isPinned = pinned,
+            pinnedBy = if (pinned) currentUserId else null,
+            pinnedAt = if (pinned) Instant.now().toString() else null
+        )
     }
 
     /**
@@ -384,28 +461,28 @@ class ChatChannelState(
                 client.onMessage.collect { message ->
                     if (message.roomId != roomId) return@collect
 
-                    // Check if message already exists by server ID
-                    val existingIndex = _messages.indexOfFirst { it.id == message.id }
-                    if (existingIndex >= 0) {
-                        _messages[existingIndex] = message
-                    } else {
-                        // Check for pending optimistic message from same sender with matching content
-                        // (handles race where realtime event arrives before API response)
-                        val pendingIndex = _messages.indexOfFirst {
-                            it.isPending && it.senderUserId == message.senderUserId && it.content == message.content
-                        }
-                        if (pendingIndex >= 0) {
-                            _messages[pendingIndex] = message
-                        } else {
-                            // Add new message at beginning (newest first)
-                            _messages.add(0, message)
-                        }
-                    }
+                    mergeLiveMessage(_messages, message)
 
                     // Mark as read if from other user
                     if (message.senderUserId != currentUserId) {
                         markAsReadSilently()
                     }
+                }
+            },
+
+            // Offline outbox: a queued message was stored
+            scope.launch {
+                client.onMessageSent.collect { event ->
+                    if (event.message.roomId != roomId) return@collect
+                    applySent(event.localId, event.message)
+                }
+            },
+
+            // Offline outbox: a queued message left the queue unsent
+            scope.launch {
+                client.onMessageFailed.collect { event ->
+                    if (event.roomId != roomId) return@collect
+                    markQueuedFailed(_messages, event.localId)
                 }
             },
 
@@ -550,16 +627,19 @@ class ChatChannelState(
 
     /**
      * Clean up resources.
+     *
+     * Leaves the room's presence and typing channels but keeps its chat
+     * channel, so anything else watching the room (a conversation list,
+     * unread badges) keeps receiving its messages. Only this screen's own
+     * listeners are dropped.
      */
     fun dispose() {
         collectionJobs.forEach { it.cancel() }
         typingTimers.values.forEach { it.cancel() }
-        scope.launch {
-            try {
-                client.unsubscribeRoom(roomId)
-            } catch (e: Exception) {
-                // Ignore unsubscribe errors
-            }
+        try {
+            client.leaveRoom(roomId)
+        } catch (e: Exception) {
+            // Client already disposed: nothing left to leave.
         }
     }
 }
@@ -590,4 +670,60 @@ fun rememberChatChannelState(
     }
 
     return state
+}
+
+/**
+ * A live message event: updates the copy already shown (same id, or the
+ * message queued offline with the same clientMessageId, or the optimistic
+ * copy with the same sender and text), else adds it on top. Never twice.
+ */
+internal fun mergeLiveMessage(messages: MutableList<Message>, message: Message) {
+    val existingIndex = messages.indexOfFirst { it.id == message.id }
+    val queuedIndex = message.clientMessageId?.let { cmid ->
+        messages.indexOfFirst { it.id != message.id && it.clientMessageId == cmid }
+    } ?: -1
+    when {
+        existingIndex >= 0 -> {
+            messages[existingIndex] = message
+            if (queuedIndex >= 0) messages.removeAt(queuedIndex)
+        }
+        queuedIndex >= 0 -> messages[queuedIndex] = message
+        else -> {
+            // Pending optimistic message from the same sender with the same text
+            // (the realtime event arrived before the API response)
+            val pendingIndex = messages.indexOfFirst {
+                it.isPending && !it.id.startsWith("local_") &&
+                    it.senderUserId == message.senderUserId && it.content == message.content
+            }
+            if (pendingIndex >= 0) messages[pendingIndex] = message else messages.add(0, message)
+        }
+    }
+}
+
+/**
+ * The offline outbox stored a queued message: replaces its "Waiting for
+ * network…" copy ([localId]), or drops that copy when the live event already
+ * showed the message. Never twice.
+ */
+internal fun mergeSentMessage(messages: MutableList<Message>, localId: String, message: Message) {
+    val shownIndex = messages.indexOfFirst {
+        it.id == message.id ||
+            (!it.isPending && message.clientMessageId != null && it.clientMessageId == message.clientMessageId)
+    }
+    val localIndex = messages.indexOfFirst { it.id == localId }
+    when {
+        shownIndex >= 0 -> {
+            if (localIndex >= 0 && localIndex != shownIndex) messages.removeAt(localIndex)
+            val again = messages.indexOfFirst { it.id == message.id }
+            if (again >= 0) messages[again] = message
+        }
+        localIndex >= 0 -> messages[localIndex] = message
+        else -> messages.add(0, message)
+    }
+}
+
+/** A failed queued message: shown as failed with Retry. */
+internal fun markQueuedFailed(messages: MutableList<Message>, localId: String) {
+    val index = messages.indexOfFirst { it.id == localId }
+    if (index >= 0) messages[index] = messages[index].copy(isPending = false, isFailed = true)
 }

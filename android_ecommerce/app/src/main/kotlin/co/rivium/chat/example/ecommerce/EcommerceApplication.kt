@@ -10,12 +10,17 @@ class EcommerceApplication : Application() {
 
     companion object {
         private const val TAG = "EcommerceApp"
-        // Same API key used by RiviumChat SDK
-        private const val API_KEY = "rv_live_64e0ada5eeb66e3adf6136337802a5a34713ce4966372854"
+        // Same public key as the RiviumChat SDK, from local.properties (RIVIUM_API_KEY).
+        private val API_KEY = BuildConfig.RIVIUM_API_KEY
     }
 
     override fun onCreate() {
         super.onCreate()
+
+        if (API_KEY.isBlank()) {
+            Log.e(TAG, "RIVIUM_API_KEY is not set: copy local.properties.example to local.properties and add your key")
+            return
+        }
 
         val config = RiviumPushConfig(
             apiKey = API_KEY,

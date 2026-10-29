@@ -24,8 +24,8 @@ Add to your module's `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("co.rivium:rivium-chat-android:0.1.0")
-    implementation("co.rivium:rivium-chat-android-ui:0.1.0")
+    implementation("co.rivium:rivium-chat-android:0.2.0")
+    implementation("co.rivium:rivium-chat-android-ui:0.2.0")
 }
 ```
 
@@ -124,6 +124,63 @@ client.onReadReceipt.collect { event ->
 client.markAsRead(room.id)
 ```
 
+### 6. Search Messages
+
+```kotlin
+val result = client.searchMessagesWithTotal(room.id, query = "Order #1001")
+println("${result.total} matches")
+result.messages.forEach { println(it.content) }
+```
+
+`total` counts every match, not only this page; `hasMore` says whether another page follows (pass `limit` and `offset` to page). `searchMessages()` still returns only the list.
+
+## Sending while offline
+
+By default `sendMessage()` throws when there is no network. Turn on the offline queue to keep such messages and send them when the connection is back, in the order written and never twice:
+
+```kotlin
+val client = RiviumChatClient(
+    RiviumChatConfig(
+        apiKey = "rv_live_demo_app",
+        userId = "user-42",
+        queueOfflineMessages = true
+    )
+)
+
+val message = client.sendMessage(roomId, content = "Order #1001 is ready")
+if (message.isPending) {
+    // Queued: shown as waiting, sent when the network is back
+}
+
+scope.launch {
+    client.onMessageSent.collect { event ->
+        // event.localId (the pending id) -> event.message (the stored message)
+    }
+}
+scope.launch {
+    client.onMessageFailed.collect { event ->
+        // event.reason: "expired" (waited 24 hours) or "rejected" (refused by the server)
+    }
+}
+```
+
+- Only network failures are queued (no network, timeout, a failing `tokenProvider`, 5xx, 408, 429). Errors the server answers, such as not a member of the room or an invalid message, still throw.
+- A queued message has `isPending = true`, the id `local_<clientMessageId>` and `clientMessageId`. The stored message (and its live `onMessage` event) carries the same `clientMessageId`, so you can replace the pending copy.
+- The queue is sent when the realtime connection comes back, and with `retryPendingMessages()`. `getPendingMessages(roomId)` lists what waits; `cancelPendingMessage(localId)` removes one (a message already being sent cannot be recalled). Queued messages of another user on the same device are never sent.
+- Attachments must already be uploaded (URLs); uploads themselves are not queued.
+- The queue lives in memory. To keep it across app restarts, pass `context = applicationContext` (SharedPreferences), or your own `outboxStore`:
+
+```kotlin
+RiviumChatConfig(
+    apiKey = "rv_live_demo_app",
+    userId = "user-42",
+    queueOfflineMessages = true,
+    context = applicationContext
+)
+```
+
+Call `client.clearPendingMessages()` on sign-out when another user may sign in on the device. The UI kit's chat screen shows queued messages as "Waiting for network…".
+
 ## Modules
 
 | Module | Description | Min SDK |
@@ -159,6 +216,8 @@ The `android_ecommerce/` directory contains a complete e-commerce chat example d
 - Unread message badges
 - Message pagination
 - Reply to messages
+
+To run it, copy `android_ecommerce/local.properties.example` into `android_ecommerce/local.properties` and set `RIVIUM_API_KEY` to your project's public key (`rv_live_...`) from [Rivium Console](https://console.rivium.co). `local.properties` is gitignored, so your key stays out of version control.
 
 ## Push Notifications
 

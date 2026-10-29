@@ -1,5 +1,7 @@
 package co.rivium.chat
 
+import android.content.Context
+import co.rivium.chat.outbox.OutboxStore
 import java.io.File
 
 /**
@@ -41,13 +43,26 @@ typealias ChatTokenProvider = suspend () -> String
  *   expires, and when the server reports an expired token — refreshes are
  *   invisible to the user. Without it the SDK uses the legacy mode
  *   (API key + [userId]), which a project can disable in Rivium Console.
+ * @param queueOfflineMessages Off by default: `sendMessage()` without network
+ *   throws, as before. When on, a message that cannot be sent because of the
+ *   network (no network, timeout, server busy) is kept and sent when the
+ *   connection is back, in order and never twice; `sendMessage()` returns it
+ *   as a pending message (`isPending = true`). See `onMessageSent` and
+ *   `onMessageFailed`.
+ * @param context Optional. With [queueOfflineMessages], keeps the queue in
+ *   SharedPreferences so it survives an app restart (otherwise in memory).
+ * @param outboxStore Optional. Your own storage for the queue; wins over
+ *   [context].
  */
 data class RiviumChatConfig(
     val apiKey: String,
     val userId: String,
     val userInfo: Map<String, String>? = null,
     val fileUploader: FileUploader? = null,
-    val tokenProvider: ChatTokenProvider? = null
+    val tokenProvider: ChatTokenProvider? = null,
+    val queueOfflineMessages: Boolean = false,
+    val context: Context? = null,
+    val outboxStore: OutboxStore? = null
 ) {
     init {
         require(apiKey.isNotBlank()) { "API key cannot be blank" }

@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import co.rivium.chat.events.AuthErrorEvent
 import kotlinx.coroutines.runBlocking
+import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -15,15 +16,23 @@ import okhttp3.Response
 import java.io.IOException
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import java.util.concurrent.TimeUnit
 
 /**
  * HTTP API service for RiviumChat backend.
  */
-class ApiService(
+class ApiService internal constructor(
     private val config: RiviumChatConfig,
-    private val onAuthError: ((AuthErrorEvent) -> Unit)? = null
+    private val onAuthError: ((AuthErrorEvent) -> Unit)?,
+    /** Answers requests instead of the network; tests only. */
+    transport: Interceptor?
 ) {
+
+    constructor(
+        config: RiviumChatConfig,
+        onAuthError: ((AuthErrorEvent) -> Unit)? = null
+    ) : this(config, onAuthError, null)
 
     private val tokens: TokenManager? = config.tokenProvider?.let { TokenManager(it) }
 
@@ -33,6 +42,7 @@ class ApiService(
         .writeTimeout(30, TimeUnit.SECONDS)
         .addInterceptor(defaultHeadersInterceptor(config.apiKey))
         .addInterceptor(userTokenInterceptor())
+        .apply { transport?.let { addInterceptor(it) } }
         .build()
 
     /**
@@ -73,14 +83,14 @@ class ApiService(
 
     /** The identity error code (`token_*`) of a 401 body, if any. */
     private fun authErrorCode(response: Response): String? = try {
-        val code = JSONObject(response.peekBody(PEEK_LIMIT).string()).optString("code")
+        val code = JSONObject(response.peekBody(PEEK_LIMIT).string()).stringOr("code", "")
         if (code.startsWith("token_")) code else null
     } catch (e: Exception) {
         null
     }
 
     private fun authErrorMessage(response: Response): String = try {
-        JSONObject(response.peekBody(PEEK_LIMIT).string()).optString("message", "Authentication failed")
+        JSONObject(response.peekBody(PEEK_LIMIT).string()).stringOr("message", "Authentication failed")
     } catch (e: Exception) {
         "Authentication failed"
     }
@@ -92,8 +102,20 @@ class ApiService(
     /** Forgets the cached user token (e.g. on logout). */
     fun clearUserToken() = tokens?.clear()
 
-    /** A user token for the realtime connection, when a tokenProvider is set. */
-    internal suspend fun userTokenOrNull(): String? = tokens?.get()
+    /**
+     * A user token for the realtime connection, when a tokenProvider is set.
+     * A failing provider is reported as `token_provider_failed`, the same way
+     * the REST calls report it, and then rethrown.
+     */
+    internal suspend fun userTokenOrNull(): String? {
+        val manager = tokens ?: return null
+        return try {
+            manager.get()
+        } catch (e: Exception) {
+            reportAuthError("token_provider_failed", "tokenProvider failed", e)
+            throw e
+        }
+    }
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
@@ -137,7 +159,7 @@ class ApiService(
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms")
+            .url(apiUrl("rooms"))
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
 
@@ -168,7 +190,7 @@ class ApiService(
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms/find-or-create")
+            .url(apiUrl("rooms", "find-or-create"))
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
 
@@ -190,8 +212,10 @@ class ApiService(
      * Get a room by its external ID.
      */
     suspend fun getRoomByExternalId(externalId: String): Room = withContext(Dispatchers.IO) {
+        // External IDs are app-chosen ("Order #1001"): encode them as one path segment.
+        val url = apiUrl("rooms", "by-external-id", externalId)
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms/by-external-id/$externalId")
+            .url(url)
             .get()
             .build()
 
@@ -208,7 +232,7 @@ class ApiService(
      */
     suspend fun listRooms(userId: String): List<Room> = withContext(Dispatchers.IO) {
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms?userId=$userId")
+            .url(apiUrl("rooms", query = listOf("userId" to userId)))
             .get()
             .build()
 
@@ -226,7 +250,7 @@ class ApiService(
      */
     suspend fun getRoom(roomId: String): Room = withContext(Dispatchers.IO) {
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms/$roomId")
+            .url(apiUrl("rooms", roomId))
             .get()
             .build()
 
@@ -256,7 +280,7 @@ class ApiService(
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms/$roomId/participants")
+            .url(apiUrl("rooms", roomId, "participants"))
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
 
@@ -280,7 +304,8 @@ class ApiService(
         type: MessageType = MessageType.TEXT,
         attachments: List<Attachment>? = null,
         metadata: Map<String, Any>? = null,
-        replyToId: String? = null
+        replyToId: String? = null,
+        clientMessageId: String? = null
     ): Message = withContext(Dispatchers.IO) {
         val body = JSONObject().apply {
             put("senderUserId", senderUserId)
@@ -298,16 +323,18 @@ class ApiService(
             }
             metadata?.let { put("metadata", JSONObject(it)) }
             replyToId?.let { put("replyToId", it) }
+            clientMessageId?.let { put("clientMessageId", it) }
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms/$roomId/messages")
+            .url(apiUrl("rooms", roomId, "messages"))
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
 
         val response = client.newCall(request).execute()
         if (!response.isSuccessful) {
-            throw RiviumChatException("Failed to send message: ${response.code}")
+            response.close()
+            throw RiviumChatException("Failed to send message: ${response.code}", null, response.code)
         }
 
         parseMessage(JSONObject(response.body!!.string()))
@@ -322,11 +349,13 @@ class ApiService(
         limit: Int = 50,
         before: String? = null
     ): PaginatedMessages = withContext(Dispatchers.IO) {
-        val url = StringBuilder("${RiviumChatConfig.BASE_URL}/api/v1/rooms/$roomId/messages?userId=$userId&limit=$limit")
-        before?.let { url.append("&before=$it") }
+        val url = apiUrl(
+            "rooms", roomId, "messages",
+            query = listOf("userId" to userId, "limit" to limit.toString(), "before" to before)
+        )
 
         val request = Request.Builder()
-            .url(url.toString())
+            .url(url)
             .get()
             .build()
 
@@ -352,7 +381,7 @@ class ApiService(
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms/$roomId/read")
+            .url(apiUrl("rooms", roomId, "read"))
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
 
@@ -367,7 +396,7 @@ class ApiService(
      */
     suspend fun deleteMessage(messageId: String, userId: String): Unit = withContext(Dispatchers.IO) {
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/messages/$messageId?userId=$userId")
+            .url(apiUrl("messages", messageId, query = listOf("userId" to userId)))
             .delete()
             .build()
 
@@ -391,7 +420,7 @@ class ApiService(
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/messages/$messageId")
+            .url(apiUrl("messages", messageId))
             .put(body.toString().toRequestBody(jsonMediaType))
             .build()
 
@@ -412,8 +441,17 @@ class ApiService(
         query: String,
         limit: Int = 20,
         offset: Int = 0
-    ): List<Message> = withContext(Dispatchers.IO) {
-        val url = "${RiviumChatConfig.BASE_URL}/api/v1/rooms/$roomId/messages/search?userId=$userId&q=$query&limit=$limit&offset=$offset"
+    ): List<Message> = searchMessagesWithTotal(roomId, userId, query, limit, offset).messages
+
+    /** Searches messages in a room and reports how many match in total. */
+    suspend fun searchMessagesWithTotal(
+        roomId: String,
+        userId: String,
+        query: String,
+        limit: Int = 20,
+        offset: Int = 0
+    ): SearchResult = withContext(Dispatchers.IO) {
+        val url = searchUrl(roomId, userId, query, limit, offset)
 
         val request = Request.Builder()
             .url(url)
@@ -425,8 +463,31 @@ class ApiService(
             throw RiviumChatException("Failed to search messages: ${response.code}")
         }
 
-        val json = JSONArray(response.body!!.string())
-        (0 until json.length()).map { parseMessage(json.getJSONObject(it)) }
+        parseSearchResult(response.body!!.string(), offset)
+    }
+
+    /** The search URL; see [apiUrl] for the encoding. */
+    internal fun searchUrl(roomId: String, userId: String, query: String, limit: Int, offset: Int): HttpUrl =
+        apiUrl(
+            "rooms", roomId, "messages", "search",
+            query = listOf("userId" to userId, "q" to query, "limit" to limit.toString(), "offset" to offset.toString())
+        )
+
+    /** Search answers `{ messages, total }`; a bare array is accepted too. */
+    internal fun parseSearchResponse(body: String): List<Message> = parseSearchResult(body, 0).messages
+
+    /** The search answer with its total; a bare array counts its own length. */
+    internal fun parseSearchResult(body: String, offset: Int): SearchResult {
+        val json = JSONTokener(body).nextValue()
+        val array = when (json) {
+            is JSONObject -> json.optJSONArray("messages") ?: JSONArray()
+            is JSONArray -> json
+            else -> JSONArray()
+        }
+        val messages = (0 until array.length()).map { parseMessage(array.getJSONObject(it)) }
+        val total = (json as? JSONObject)?.takeIf { it.has("total") && !it.isNull("total") }
+            ?.optInt("total", messages.size) ?: messages.size
+        return SearchResult(messages = messages, total = total, hasMore = offset + messages.size < total)
     }
 
     // ─── Unread Summary ──────────────────────────────────────────────────
@@ -436,7 +497,7 @@ class ApiService(
      */
     suspend fun getUnreadSummary(userId: String): UnreadSummary = withContext(Dispatchers.IO) {
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms/unread-summary?userId=$userId")
+            .url(apiUrl("rooms", "unread-summary", query = listOf("userId" to userId)))
             .get()
             .build()
 
@@ -453,7 +514,7 @@ class ApiService(
                 val room = rooms.getJSONObject(i)
                 RoomUnread(
                     roomId = room.getString("roomId"),
-                    externalId = room.optString("externalId", null),
+                    externalId = room.stringOrNull("externalId"),
                     unreadCount = room.getInt("unreadCount")
                 )
             }
@@ -476,7 +537,7 @@ class ApiService(
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/messages/$messageId/reactions")
+            .url(apiUrl("messages", messageId, "reactions"))
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
 
@@ -502,7 +563,7 @@ class ApiService(
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/messages/$messageId/reactions")
+            .url(apiUrl("messages", messageId, "reactions"))
             .delete(body.toString().toRequestBody(jsonMediaType))
             .build()
 
@@ -517,7 +578,7 @@ class ApiService(
      */
     suspend fun getReactions(messageId: String): List<Reaction> = withContext(Dispatchers.IO) {
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/messages/$messageId/reactions")
+            .url(apiUrl("messages", messageId, "reactions"))
             .get()
             .build()
 
@@ -541,7 +602,7 @@ class ApiService(
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/messages/$messageId/pin")
+            .url(apiUrl("messages", messageId, "pin"))
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
 
@@ -562,7 +623,7 @@ class ApiService(
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/messages/$messageId/pin")
+            .url(apiUrl("messages", messageId, "pin"))
             .delete(body.toString().toRequestBody(jsonMediaType))
             .build()
 
@@ -577,7 +638,7 @@ class ApiService(
      */
     suspend fun getPinnedMessages(roomId: String): List<Message> = withContext(Dispatchers.IO) {
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms/$roomId/pinned")
+            .url(apiUrl("rooms", roomId, "pinned"))
             .get()
             .build()
 
@@ -602,7 +663,7 @@ class ApiService(
         offset: Int = 0
     ): List<Message> = withContext(Dispatchers.IO) {
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/rooms/$roomId/mentions?userId=$userId&limit=$limit&offset=$offset")
+            .url(apiUrl("rooms", roomId, "mentions", query = listOf("userId" to userId, "limit" to limit.toString(), "offset" to offset.toString())))
             .get()
             .build()
 
@@ -611,8 +672,26 @@ class ApiService(
             throw RiviumChatException("Failed to get mentions: ${response.code}")
         }
 
-        val json = JSONArray(response.body!!.string())
-        (0 until json.length()).map { parseMessage(json.getJSONObject(it)) }
+        parseMentionsResponse(response.body!!.string())
+    }
+
+    /**
+     * Mentions answer a list of mention records, `{ id, messageId,
+     * mentionedUserId, roomId, createdAt, message }`; the mentioning message
+     * is returned. A record without its message is skipped.
+     */
+    internal fun parseMentionsResponse(body: String): List<Message> {
+        val records = JSONArray(body)
+        return (0 until records.length()).mapNotNull { i ->
+            val record = records.getJSONObject(i)
+            val message = record.optJSONObject("message")
+            when {
+                message != null -> parseMessage(message)
+                // A message itself rather than a mention record.
+                record.has("senderUserId") -> parseMessage(record)
+                else -> null
+            }
+        }
     }
 
     // ─── Centrifugo Token ──────────────────────────────────────────────────
@@ -627,7 +706,7 @@ class ApiService(
         }
 
         val request = Request.Builder()
-            .url("${RiviumChatConfig.BASE_URL}/api/v1/centrifugo/token")
+            .url(apiUrl("centrifugo", "token"))
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
 
@@ -647,22 +726,28 @@ class ApiService(
             (0 until arr.length()).map { parseParticipant(arr.getJSONObject(it)) }
         } ?: emptyList()
 
-        val metadata = json.optJSONObject("metadata")?.let { obj ->
-            val map = mutableMapOf<String, String>()
-            obj.keys().forEach { key -> map[key] = obj.optString(key) }
-            map
-        }
+        val metadata = json.optJSONObject("metadata")?.stringMap()
 
         return Room(
             id = json.getString("id"),
-            type = RoomType.valueOf(json.optString("type", "direct").uppercase()),
-            externalId = json.optString("externalId", null),
-            name = json.optString("name", null),
+            type = RoomType.valueOf(json.stringOr("type", "direct").uppercase()),
+            externalId = json.stringOrNull("externalId"),
+            name = json.stringOrNull("name"),
             metadata = metadata,
             isActive = json.optBoolean("isActive", true),
-            createdAt = json.optString("createdAt", null),
-            updatedAt = json.optString("updatedAt", null),
-            participants = participants
+            createdAt = json.stringOrNull("createdAt"),
+            updatedAt = json.stringOrNull("updatedAt"),
+            participants = participants,
+            // Sent by GET /rooms. A preview that cannot be read must not
+            // fail the whole room list.
+            lastMessage = json.optJSONObject("lastMessage")?.let {
+                try {
+                    parseMessage(it)
+                } catch (e: Exception) {
+                    null
+                }
+            },
+            unreadCount = json.optInt("unreadCount", 0)
         )
     }
 
@@ -670,68 +755,22 @@ class ApiService(
         return Participant(
             id = json.getString("id"),
             externalUserId = json.getString("externalUserId"),
-            displayName = json.optString("displayName", null),
-            locale = json.optString("locale", null),
-            role = ParticipantRole.valueOf(json.optString("role", "member").uppercase()),
-            lastReadAt = json.optString("lastReadAt", null),
+            displayName = json.stringOrNull("displayName"),
+            locale = json.stringOrNull("locale"),
+            role = ParticipantRole.valueOf(json.stringOr("role", "member").uppercase()),
+            lastReadAt = json.stringOrNull("lastReadAt"),
             joinedAt = json.getString("joinedAt")
         )
     }
 
-    fun parseMessage(json: JSONObject): Message {
-        val attachments = json.optJSONArray("attachments")?.let { arr ->
-            (0 until arr.length()).map { parseAttachment(arr.getJSONObject(it)) }
-        }
-
-        val reactions = json.optJSONArray("reactions")?.let { arr ->
-            (0 until arr.length()).map { parseReaction(arr.getJSONObject(it)) }
-        }
-
-        val replyTo = json.optJSONObject("replyTo")?.let { parseMessage(it) }
-
-        val metadata = json.optJSONObject("metadata")?.let { obj ->
-            val map = mutableMapOf<String, String>()
-            obj.keys().forEach { key -> map[key] = obj.optString(key) }
-            map
-        }
-
-        val editHistory = json.optJSONArray("editHistory")?.let { arr ->
-            (0 until arr.length()).map { i ->
-                val entry = arr.getJSONObject(i)
-                val map = mutableMapOf<String, String>()
-                entry.keys().forEach { key -> map[key] = entry.optString(key) }
-                map
-            }
-        }
-
-        return Message(
-            id = json.getString("id"),
-            roomId = json.getString("roomId"),
-            senderUserId = json.getString("senderUserId"),
-            content = json.optString("content", ""),
-            type = MessageType.valueOf(json.optString("type", "text").uppercase()),
-            attachments = attachments,
-            metadata = metadata,
-            replyToId = json.optString("replyToId", null),
-            replyTo = replyTo,
-            isDeleted = json.optBoolean("isDeleted", false),
-            createdAt = json.getString("createdAt"),
-            isEdited = json.optBoolean("isEdited", false),
-            editedAt = json.optString("editedAt", null),
-            editHistory = editHistory,
-            isPinned = json.optBoolean("isPinned", false),
-            pinnedAt = json.optString("pinnedAt", null),
-            pinnedBy = json.optString("pinnedBy", null),
-            reactions = reactions
-        )
-    }
+    fun parseMessage(json: JSONObject): Message = Message.fromJson(json)
 
     private fun parseAttachment(json: JSONObject): Attachment {
         return Attachment(
             url = json.getString("url"),
-            mimeType = json.optString("mimeType", null),
-            name = json.optString("name", null),
-            size = if (json.has("size")) json.getInt("size") else null
+            mimeType = json.stringOrNull("mimeType"),
+            name = json.stringOrNull("name"),
+            size = json.intOrNull("size")
         )
     }
 
@@ -755,4 +794,12 @@ class ApiService(
 }
 
 /** Exception thrown by RiviumChat SDK operations. */
-class RiviumChatException(message: String, cause: Throwable? = null) : Exception(message, cause)
+class RiviumChatException(message: String, cause: Throwable? = null) : Exception(message, cause) {
+    /** The HTTP status the API answered with, when the error came from an answer. */
+    var statusCode: Int? = null
+        private set
+
+    constructor(message: String, cause: Throwable?, statusCode: Int?) : this(message, cause) {
+        this.statusCode = statusCode
+    }
+}

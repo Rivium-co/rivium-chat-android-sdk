@@ -6,6 +6,8 @@ import co.rivium.chat.models.*
 import co.rivium.chat.models.SubscriptionStatus
 import io.github.centrifugal.centrifuge.Client
 import io.github.centrifugal.centrifuge.ConnectedEvent
+import io.github.centrifugal.centrifuge.ConnectionTokenEvent
+import io.github.centrifugal.centrifuge.ConnectionTokenGetter
 import io.github.centrifugal.centrifuge.ConnectingEvent
 import io.github.centrifugal.centrifuge.DisconnectedEvent
 import io.github.centrifugal.centrifuge.ErrorEvent
@@ -21,8 +23,11 @@ import io.github.centrifugal.centrifuge.SubscribedEvent
 import io.github.centrifugal.centrifuge.SubscribingEvent
 import io.github.centrifugal.centrifuge.SubscriptionErrorEvent
 import io.github.centrifugal.centrifuge.SubscriptionEventListener
+import io.github.centrifugal.centrifuge.TokenCallback
 import io.github.centrifugal.centrifuge.UnsubscribedEvent
 import io.github.centrifugal.centrifuge.PresenceResult
+import io.github.centrifugal.centrifuge.ReplyError
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -30,8 +35,12 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
+import kotlin.coroutines.resume
 import java.time.Instant
 
 /**
@@ -44,6 +53,9 @@ class RealtimeService(
 ) {
 
     private var client: Client? = null
+
+    /** Whether a Centrifuge client (a socket) exists. */
+    internal val hasClient: Boolean get() = client != null
     private val subscriptions = mutableMapOf<String, Subscription>()
 
     /**
@@ -65,7 +77,21 @@ class RealtimeService(
      */
     private val channelLock = Any()
     private val pendingRoomSubscriptions = mutableListOf<String>()
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /**
+     * Never lets an exception escape to the thread: on Android an uncaught
+     * exception in a coroutine kills the app. Event handlers catch their own
+     * errors; this is the last line of defence.
+     */
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, _ -> }
+    )
+
+    /**
+     * Bumped by [disconnect] and [dispose]. A [connect] still fetching its
+     * token when one of them ran must not open a socket afterwards.
+     */
+    @Volatile private var generation = 0
+    @Volatile private var disposed = false
 
     // Connection state
     private var _currentConnectionState = ConnectionState.DISCONNECTED
@@ -113,22 +139,31 @@ class RealtimeService(
 
     private fun updateState(state: ConnectionState) {
         _currentConnectionState = state
-        scope.launch { _connectionState.emit(state) }
+        // tryEmit, not a launched emit: launched emits could arrive out of
+        // order and leave an old state (e.g. CONNECTING after ERROR) as the
+        // replayed current one. Never fails: replay 1, DROP_OLDEST.
+        _connectionState.tryEmit(state)
     }
 
     /**
      * Connect to the Centrifugo server.
      */
     fun connect() {
-        if (client != null) return
+        if (client != null || disposed) return
 
+        val attempt = generation
         scope.launch {
             try {
                 updateState(ConnectionState.CONNECTING)
 
                 val token = getToken()
+                // disconnect() or dispose() ran while the token was fetched.
+                if (attempt != generation) return@launch
                 val options = Options()
                 options.token = token
+                // Asked again whenever the token expires or is rejected, so a
+                // long-lived connection survives token expiry.
+                options.tokenGetter = connectionTokenGetter()
 
                 val centrifugeClient = Client(RiviumChatConfig.CENTRIFUGO_URL, options, object : EventListener() {
                     override fun onConnecting(client: Client, event: ConnectingEvent) {
@@ -160,9 +195,15 @@ class RealtimeService(
                     }
                 })
 
-                client = centrifugeClient
+                synchronized(channelLock) {
+                    if (attempt != generation || client != null) return@launch
+                    client = centrifugeClient
+                }
                 centrifugeClient.connect()
             } catch (e: Exception) {
+                // No connection without a token (unknown key, token required,
+                // API unreachable, tokenProvider failed): report it.
+                if (attempt != generation) return@launch
                 updateState(ConnectionState.ERROR)
                 _connectionError.emit(ConnectionErrorEvent(error = e))
             }
@@ -170,8 +211,26 @@ class RealtimeService(
     }
 
     /**
-     * Disconnect from the Centrifugo server.
+     * Fetches a fresh connection token from the same source as the first one,
+     * off Centrifuge's own thread. A failure is handed back to Centrifuge,
+     * which reports it and retries.
      */
+    internal fun connectionTokenGetter(): ConnectionTokenGetter = object : ConnectionTokenGetter() {
+        override fun getConnectionToken(event: ConnectionTokenEvent?, cb: TokenCallback) {
+            scope.launch {
+                val result = try {
+                    Result.success(getToken())
+                } catch (e: Exception) {
+                    Result.failure(e)
+                }
+                result.fold(
+                    onSuccess = { cb.Done(null, it) },
+                    onFailure = { cb.Done(it, null) }
+                )
+            }
+        }
+    }
+
     /**
      * Tears one channel down.
      *
@@ -185,8 +244,8 @@ class RealtimeService(
             val sub = subscriptions.remove(channel)
             subscribedChannels.remove(channel)
             if (sub != null) {
-                client?.removeSubscription(sub)
                 try {
+                    client?.removeSubscription(sub)
                     sub.unsubscribe()
                 } catch (_: Exception) {
                     // Socket may already be gone; freeing the registry above is
@@ -228,6 +287,7 @@ class RealtimeService(
     }
 
     fun disconnect() {
+        generation++
         // Free Centrifuge's registry as well as our own map. Clearing only our
         // map left every channel name held by the client, so each one threw
         // "already exists" on the next subscribe for the life of the process.
@@ -297,44 +357,42 @@ class RealtimeService(
 
     /**
      * Gets currently online users in a room via Centrifugo presence.
+     *
+     * Suspends instead of blocking the calling thread; gives up after 5
+     * seconds with an empty set, as before.
      */
-    fun getRoomPresence(roomId: String): Set<String> {
+    suspend fun getRoomPresence(roomId: String): Set<String> {
         val channel = "presence:room_$roomId"
-        val sub = subscriptions[channel] ?: return emptySet()
+        val sub = synchronized(channelLock) { subscriptions[channel] } ?: return emptySet()
 
-        val future = java.util.concurrent.CompletableFuture<Set<String>>()
-        sub.presence { error, result ->
-            if (error != null || result == null) {
-                future.complete(emptySet())
-            } else {
-                future.complete(
-                    result.clients.values
-                        .map { it.user }
-                        .filter { it.isNotEmpty() }
-                        .toSet()
-                )
+        return withTimeoutOrNull(PRESENCE_TIMEOUT_MS) {
+            suspendCancellableCoroutine<Set<String>> { continuation ->
+                sub.presence { error, result ->
+                    val users = if (error != null || result == null) {
+                        emptySet()
+                    } else {
+                        result.clients.values
+                            .map { it.user }
+                            .filter { it.isNotEmpty() }
+                            .toSet()
+                    }
+                    if (continuation.isActive) continuation.resume(users)
+                }
             }
-        }
-
-        return try {
-            future.get(5, java.util.concurrent.TimeUnit.SECONDS)
-        } catch (e: Exception) {
-            emptySet()
-        }
+        } ?: emptySet()
     }
 
-    private var lastTypingTime: Long = 0
+    /** Last typing publish per room, so typing in one room never mutes another. */
+    private val lastTypingTimes = mutableMapOf<String, Long>()
 
     /**
-     * Publish typing indicator via realtime channel (throttled to 2 seconds).
+     * Publish typing indicator via realtime channel (throttled to 2 seconds per room).
      */
     fun publishTyping(roomId: String) {
-        val now = System.currentTimeMillis()
-        if (now - lastTypingTime < 2000) return
-        lastTypingTime = now
-
         val channel = "typing:room_$roomId"
-        val subscription = subscriptions[channel] ?: return
+        val subscription = synchronized(channelLock) { subscriptions[channel] } ?: return
+
+        if (!shouldPublishTyping(roomId, System.currentTimeMillis())) return
 
         val data = JSONObject().apply {
             put("userId", config.userId)
@@ -350,6 +408,14 @@ class RealtimeService(
         } catch (e: Exception) {
             // Ignore publish errors
         }
+    }
+
+    /** Throttles typing to one publish per [TYPING_THROTTLE_MS] for each room. */
+    internal fun shouldPublishTyping(roomId: String, now: Long): Boolean = synchronized(lastTypingTimes) {
+        val last = lastTypingTimes[roomId]
+        if (last != null && now - last < TYPING_THROTTLE_MS) return false
+        lastTypingTimes[roomId] = now
+        true
     }
 
     private fun subscribeToChatChannel(client: Client, roomId: String) {
@@ -414,16 +480,18 @@ class RealtimeService(
                     subscriptions.remove(channel)?.let { client?.removeSubscription(it) }
                 }
                 scope.launch {
+                    val (code, reason) = subscriptionFailure(event.error)
                     _subscriptionState.emit(
                         SubscriptionStateEvent(
                             roomId = roomId,
                             channel = channel,
                             status = SubscriptionStatus.ERROR,
-                            reason = event.error.message
+                            code = code,
+                            reason = reason
                         )
                     )
                     _connectionError.emit(
-                        ConnectionErrorEvent(error = "Subscription failed on $channel: ${event.error.message}")
+                        ConnectionErrorEvent(error = "Subscription failed on $channel: $reason")
                     )
                     _recoveryFailed.emit(roomId)
                 }
@@ -468,6 +536,17 @@ class RealtimeService(
 
             override fun onUnsubscribed(sub: Subscription, event: UnsubscribedEvent) {
                 synchronized(channelLock) { subscribedChannels.remove(channel) }
+                scope.launch {
+                    _subscriptionState.emit(
+                        SubscriptionStateEvent(
+                            roomId = roomId,
+                            channel = channel,
+                            status = SubscriptionStatus.UNSUBSCRIBED,
+                            code = event.code,
+                            reason = event.reason
+                        )
+                    )
+                }
             }
 
             // Without this a rejected subscribe was invisible: the channel
@@ -479,16 +558,18 @@ class RealtimeService(
                     subscriptions.remove(channel)?.let { client?.removeSubscription(it) }
                 }
                 scope.launch {
+                    val (code, reason) = subscriptionFailure(event.error)
                     _subscriptionState.emit(
                         SubscriptionStateEvent(
                             roomId = roomId,
                             channel = channel,
                             status = SubscriptionStatus.ERROR,
-                            reason = event.error.message
+                            code = code,
+                            reason = reason
                         )
                     )
                     _connectionError.emit(
-                        ConnectionErrorEvent(error = "Subscription failed on $channel: ${event.error.message}")
+                        ConnectionErrorEvent(error = "Subscription failed on $channel: $reason")
                     )
                 }
             }
@@ -522,6 +603,17 @@ class RealtimeService(
 
             override fun onUnsubscribed(sub: Subscription, event: UnsubscribedEvent) {
                 synchronized(channelLock) { subscribedChannels.remove(channel) }
+                scope.launch {
+                    _subscriptionState.emit(
+                        SubscriptionStateEvent(
+                            roomId = roomId,
+                            channel = channel,
+                            status = SubscriptionStatus.UNSUBSCRIBED,
+                            code = event.code,
+                            reason = event.reason
+                        )
+                    )
+                }
             }
 
             // Without this a rejected subscribe was invisible: the channel
@@ -533,16 +625,18 @@ class RealtimeService(
                     subscriptions.remove(channel)?.let { client?.removeSubscription(it) }
                 }
                 scope.launch {
+                    val (code, reason) = subscriptionFailure(event.error)
                     _subscriptionState.emit(
                         SubscriptionStateEvent(
                             roomId = roomId,
                             channel = channel,
                             status = SubscriptionStatus.ERROR,
-                            reason = event.error.message
+                            code = code,
+                            reason = reason
                         )
                     )
                     _connectionError.emit(
-                        ConnectionErrorEvent(error = "Subscription failed on $channel: ${event.error.message}")
+                        ConnectionErrorEvent(error = "Subscription failed on $channel: $reason")
                     )
                 }
             }
@@ -553,12 +647,12 @@ class RealtimeService(
         subscription.subscribe()
     }
 
-    private fun handleChatPublication(roomId: String, data: ByteArray) {
+    internal fun handleChatPublication(roomId: String, data: ByteArray) {
         try {
             val json = JSONObject(String(data))
             // Match Flutter: check "event" first, fall back to "type"
-            val eventType = if (json.has("event")) json.optString("event", null)
-                            else json.optString("type", null)
+            val eventType = if (json.has("event")) json.stringOrNull("event")
+                            else json.stringOrNull("type")
 
             // Match Flutter: payload is in "data" sub-object, or root JSON as fallback
             val payload = if (json.has("data") && json.optJSONObject("data") != null)
@@ -566,76 +660,83 @@ class RealtimeService(
                           else json
 
             scope.launch {
-                when (eventType) {
-                    "message" -> {
-                        _messages.emit(Message.fromJson(payload))
-                    }
-                    "read" -> {
-                        _readReceipts.emit(ReadReceipt.fromJson(payload))
-                    }
-                    "deleted" -> {
-                        _messageDeletions.emit(MessageDeletion.fromJson(payload))
-                    }
-                    "message_edited" -> {
-                        _messageEdits.emit(
-                            MessageEditEvent(
-                                messageId = payload.getString("messageId"),
-                                roomId = payload.optString("roomId", null) ?: roomId,
-                                content = payload.getString("content"),
-                                editedBy = payload.getString("editedBy"),
-                                editedAt = Instant.parse(payload.getString("editedAt"))
-                            )
-                        )
-                    }
-                    "reaction_added" -> {
-                        _reactions.emit(
-                            ReactionEvent(
-                                messageId = payload.getString("messageId"),
-                                roomId = payload.optString("roomId", null) ?: roomId,
-                                userId = payload.getString("userId"),
-                                emoji = payload.getString("emoji"),
-                                added = true,
-                                reactionId = payload.optString("reactionId", null)
-                            )
-                        )
-                    }
-                    "reaction_removed" -> {
-                        _reactions.emit(
-                            ReactionEvent(
-                                messageId = payload.getString("messageId"),
-                                roomId = payload.optString("roomId", null) ?: roomId,
-                                userId = payload.getString("userId"),
-                                emoji = payload.getString("emoji"),
-                                added = false
-                            )
-                        )
-                    }
-                    "message_pinned" -> {
-                        _messagePins.emit(
-                            MessagePinEvent(
-                                messageId = payload.getString("messageId"),
-                                roomId = payload.optString("roomId", null) ?: roomId,
-                                userId = payload.getString("pinnedBy"),
-                                pinned = true
-                            )
-                        )
-                    }
-                    "message_unpinned" -> {
-                        _messagePins.emit(
-                            MessagePinEvent(
-                                messageId = payload.getString("messageId"),
-                                roomId = payload.optString("roomId", null) ?: roomId,
-                                userId = payload.getString("unpinnedBy"),
-                                pinned = false
-                            )
-                        )
-                    }
-                    else -> {
-                        // Fallback: if no event type, try parsing as a direct message
-                        if (payload.has("id") && payload.has("content")) {
+                // Parsing happens here, inside the coroutine: an exception
+                // thrown in a launched coroutine is uncaught and would crash
+                // the app, so a malformed event is dropped instead.
+                try {
+                    when (eventType) {
+                        "message" -> {
                             _messages.emit(Message.fromJson(payload))
                         }
+                        "read" -> {
+                            _readReceipts.emit(ReadReceipt.fromJson(payload))
+                        }
+                        "deleted" -> {
+                            _messageDeletions.emit(MessageDeletion.fromJson(payload))
+                        }
+                        "message_edited" -> {
+                            _messageEdits.emit(
+                                MessageEditEvent(
+                                    messageId = payload.getString("messageId"),
+                                    roomId = payload.stringOrNull("roomId") ?: roomId,
+                                    content = payload.getString("content"),
+                                    editedBy = payload.getString("editedBy"),
+                                    editedAt = Instant.parse(payload.getString("editedAt"))
+                                )
+                            )
+                        }
+                        "reaction_added" -> {
+                            _reactions.emit(
+                                ReactionEvent(
+                                    messageId = payload.getString("messageId"),
+                                    roomId = payload.stringOrNull("roomId") ?: roomId,
+                                    userId = payload.getString("userId"),
+                                    emoji = payload.getString("emoji"),
+                                    added = true,
+                                    reactionId = payload.stringOrNull("reactionId")
+                                )
+                            )
+                        }
+                        "reaction_removed" -> {
+                            _reactions.emit(
+                                ReactionEvent(
+                                    messageId = payload.getString("messageId"),
+                                    roomId = payload.stringOrNull("roomId") ?: roomId,
+                                    userId = payload.getString("userId"),
+                                    emoji = payload.getString("emoji"),
+                                    added = false
+                                )
+                            )
+                        }
+                        "message_pinned" -> {
+                            _messagePins.emit(
+                                MessagePinEvent(
+                                    messageId = payload.getString("messageId"),
+                                    roomId = payload.stringOrNull("roomId") ?: roomId,
+                                    userId = payload.getString("pinnedBy"),
+                                    pinned = true
+                                )
+                            )
+                        }
+                        "message_unpinned" -> {
+                            _messagePins.emit(
+                                MessagePinEvent(
+                                    messageId = payload.getString("messageId"),
+                                    roomId = payload.stringOrNull("roomId") ?: roomId,
+                                    userId = payload.getString("unpinnedBy"),
+                                    pinned = false
+                                )
+                            )
+                        }
+                        else -> {
+                            // Fallback: if no event type, try parsing as a direct message
+                            if (payload.has("id") && payload.has("content")) {
+                                _messages.emit(Message.fromJson(payload))
+                            }
+                        }
                     }
+                } catch (e: Exception) {
+                    // Malformed event: dropped.
                 }
             }
         } catch (e: Exception) {
@@ -667,6 +768,24 @@ class RealtimeService(
      * Disposes all resources.
      */
     fun dispose() {
+        disposed = true
         disconnect()
+        // Late callbacks from the closing socket have nowhere to go.
+        scope.cancel()
+    }
+
+    internal companion object {
+        /** The server's code and reason behind a subscription error, when it sent one. */
+        fun subscriptionFailure(error: Throwable): Pair<Int?, String?> {
+            var cause: Throwable? = error
+            while (cause != null) {
+                if (cause is ReplyError) return Pair(cause.code, cause.message)
+                cause = cause.cause.takeIf { it !== cause }
+            }
+            return Pair(null, error.message)
+        }
+
+        const val PRESENCE_TIMEOUT_MS = 5_000L
+        const val TYPING_THROTTLE_MS = 2_000L
     }
 }

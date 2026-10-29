@@ -58,7 +58,7 @@ fun EcommerceApp() {
         currentUser = user
         val client = RiviumChatClient(
             config = RiviumChatConfig(
-                apiKey = "rv_live_64e0ada5eeb66e3adf6136337802a5a34713ce4966372854",
+                apiKey = BuildConfig.RIVIUM_API_KEY,
                 userId = user.id
             )
         )

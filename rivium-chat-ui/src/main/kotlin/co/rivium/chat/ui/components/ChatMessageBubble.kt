@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.AccessTime
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -86,7 +87,8 @@ fun ChatMessageBubble(
     onReactionTap: ((String) -> Unit)? = null,
     onLongClick: (() -> Unit)? = null,
     onImageClick: ((String) -> Unit)? = null,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    replySenderName: String? = null
 ) {
     val colors = RiviumChatTheme.colors
     val dimensions = RiviumChatTheme.dimensions
@@ -133,6 +135,7 @@ fun ChatMessageBubble(
             message.replyTo?.let { replyMessage ->
                 ReplyPreview(
                     message = replyMessage,
+                    senderName = replySenderName,
                     isMe = isMe,
                     modifier = Modifier
                         .widthIn(max = maxWidth)
@@ -263,6 +266,17 @@ fun ChatMessageBubble(
                         horizontalArrangement = Arrangement.End,
                         modifier = Modifier.align(Alignment.End)
                     ) {
+                        // Pinned indicator
+                        if (message.isPinned) {
+                            Icon(
+                                imageVector = Icons.Default.PushPin,
+                                contentDescription = "Pinned",
+                                tint = if (isMe) colors.myMessageText.copy(alpha = 0.7f) else colors.timestampText,
+                                modifier = Modifier.size(12.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                        }
+
                         // Edited indicator
                         if (message.isEdited) {
                             Text(
@@ -303,19 +317,44 @@ fun ChatMessageBubble(
                                             modifier = Modifier.size(14.dp)
                                         )
                                         if (onRetry != null) {
-                                            IconButton(
-                                                onClick = onRetry,
-                                                modifier = Modifier.size(20.dp)
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(8.dp))
+                                                    .clickable(onClickLabel = "Retry", onClick = onRetry)
+                                                    .padding(horizontal = 4.dp, vertical = 2.dp)
                                             ) {
                                                 Icon(
                                                     imageVector = Icons.Default.Refresh,
-                                                    contentDescription = "Retry",
+                                                    contentDescription = null,
                                                     tint = colors.failedMessage,
                                                     modifier = Modifier.size(14.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(2.dp))
+                                                Text(
+                                                    text = "Retry",
+                                                    color = colors.failedMessage,
+                                                    style = MaterialTheme.typography.labelSmall
                                                 )
                                             }
                                         }
                                     }
+                                }
+                                message.isPending && message.isQueuedOffline() -> {
+                                    // Queued by the SDK's offline outbox: sent when the network is back.
+                                    Icon(
+                                        imageVector = Icons.Default.AccessTime,
+                                        contentDescription = null,
+                                        tint = colors.myMessageText.copy(alpha = 0.7f),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(2.dp))
+                                    Text(
+                                        text = WAITING_FOR_NETWORK,
+                                        color = colors.myMessageText.copy(alpha = 0.7f),
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
                                 }
                                 message.isPending -> {
                                     Icon(
@@ -518,3 +557,9 @@ private fun formatFileSize(bytes: Long): String {
         else -> "${bytes / (1024 * 1024)} MB"
     }
 }
+
+/** Label of a message the offline outbox keeps until the network is back. */
+internal const val WAITING_FOR_NETWORK = "Waiting for network\u2026"
+
+/** A pending message the SDK queued while offline (id `local_<clientMessageId>`). */
+internal fun Message.isQueuedOffline(): Boolean = isPending && id.startsWith("local_")

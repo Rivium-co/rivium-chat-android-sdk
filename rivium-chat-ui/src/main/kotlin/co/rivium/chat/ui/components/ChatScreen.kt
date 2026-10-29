@@ -17,12 +17,15 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -81,6 +84,11 @@ fun ChatScreen(
     modifier: Modifier = Modifier
 ) {
     val state = rememberChatChannelState(roomId = roomId, currentUserId = currentUserId)
+    // Names from the room's participants; names the app passes win.
+    val displayNames = state.participantDisplayNames + userDisplayNames
+    val nameFor: (String) -> String = { userId ->
+        if (userId == currentUserId) "You" else displayNames[userId] ?: userId
+    }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     val clipboardManager = LocalClipboardManager.current
@@ -91,6 +99,10 @@ fun ChatScreen(
     var showContextMenu by remember { mutableStateOf(false) }
     var showReactionPicker by remember { mutableStateOf(false) }
     var showAttachmentPicker by remember { mutableStateOf(false) }
+
+    // Edit dialog state
+    var editingMessage by remember { mutableStateOf<Message?>(null) }
+    var editText by remember { mutableStateOf("") }
 
     // Full screen image viewer state
     var fullScreenImageUrl by remember { mutableStateOf<String?>(null) }
@@ -192,6 +204,7 @@ fun ChatScreen(
                         }
                     },
                     replyingTo = state.replyingTo,
+                    replyingToName = state.replyingTo?.let { nameFor(it.senderUserId) },
                     onCancelReply = { state.updateReplyingTo(null) },
                     onAttachmentClick = if (fileUploader != null) {{ showAttachmentPicker = true }} else null,
                     enabled = !state.isInitialLoading
@@ -212,7 +225,10 @@ fun ChatScreen(
                     )
                 }
 
-                state.error != null -> {
+                // An error with messages on screen (a failed pin or reaction)
+                // keeps the conversation visible; only a failed first load
+                // replaces it.
+                state.error != null && state.messages.isEmpty() -> {
                     // Error state
                     Column(
                         modifier = Modifier.align(Alignment.Center),
@@ -249,7 +265,8 @@ fun ChatScreen(
                         currentUserId = currentUserId,
                         otherUserLastRead = state.otherUserLastRead,
                         typingUsers = state.typingUsers,
-                        userDisplayNames = userDisplayNames,
+                        userDisplayNames = displayNames,
+                        replySenderName = { userId -> nameFor(userId) },
                         listState = listState,
                         isLoadingMore = state.isLoadingMore,
                         messageBuilder = messageBuilder,
@@ -314,7 +331,8 @@ fun ChatScreen(
                                 state.deleteMessage(selectedMessage!!.id)
                             }
                             MessageAction.EDIT -> {
-                                // Would open edit dialog
+                                editText = selectedMessage!!.content
+                                editingMessage = selectedMessage
                             }
                             MessageAction.PIN -> {
                                 if (selectedMessage!!.isPinned) {
@@ -388,6 +406,36 @@ fun ChatScreen(
         }
     }
 
+    // Edit message dialog
+    editingMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { editingMessage = null },
+            title = { Text("Edit message") },
+            text = {
+                OutlinedTextField(
+                    value = editText,
+                    onValueChange = { editText = it },
+                    maxLines = 5,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val newContent = editText.trim()
+                        if (newContent.isNotEmpty() && newContent != message.content) {
+                            scope.launch { state.editMessage(message.id, newContent) }
+                        }
+                        editingMessage = null
+                    }
+                ) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { editingMessage = null }) { Text("Cancel") }
+            }
+        )
+    }
+
     // Full screen image viewer overlay
     if (fullScreenImageUrl != null) {
         FullScreenImageViewer(
@@ -408,6 +456,7 @@ private fun MessagesList(
     otherUserLastRead: Instant?,
     typingUsers: List<String>,
     userDisplayNames: Map<String, String>,
+    replySenderName: (String) -> String,
     listState: LazyListState,
     isLoadingMore: Boolean,
     messageBuilder: (@Composable (Message, Boolean, Boolean) -> Unit)?,
@@ -465,7 +514,8 @@ private fun MessagesList(
                     } else null,
                     onReactionTap = { emoji -> onReactionTap(message.id, emoji) },
                     onLongClick = { onMessageLongClick(message) },
-                    onImageClick = onImageClick
+                    onImageClick = onImageClick,
+                    replySenderName = message.replyTo?.let { replySenderName(it.senderUserId) }
                 )
             }
         }

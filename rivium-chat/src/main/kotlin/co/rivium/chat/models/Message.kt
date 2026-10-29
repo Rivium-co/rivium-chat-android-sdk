@@ -1,6 +1,10 @@
 package co.rivium.chat.models
 
 import kotlinx.serialization.Serializable
+import co.rivium.chat.services.intOrNull
+import co.rivium.chat.services.stringMap
+import co.rivium.chat.services.stringOr
+import co.rivium.chat.services.stringOrNull
 import org.json.JSONObject
 import java.time.Instant
 
@@ -29,7 +33,12 @@ data class Message(
     val reactions: List<Reaction>? = null,
     // Local state flags (not persisted)
     val isPending: Boolean = false,
-    val isFailed: Boolean = false
+    val isFailed: Boolean = false,
+    /**
+     * The id the sending app gave the message (sent by the SDK when
+     * `queueOfflineMessages` is on); matches a pending copy to the stored one.
+     */
+    val clientMessageId: String? = null
 ) {
     fun getCreatedAtInstant(): Instant = Instant.parse(createdAt)
     fun getEditedAtInstant(): Instant? = editedAt?.let { Instant.parse(it) }
@@ -42,9 +51,9 @@ data class Message(
                     val att = arr.getJSONObject(i)
                     Attachment(
                         url = att.getString("url"),
-                        mimeType = att.optString("mimeType", null),
-                        name = att.optString("name", null),
-                        size = if (att.has("size")) att.getInt("size") else null
+                        mimeType = att.stringOrNull("mimeType"),
+                        name = att.stringOrNull("name"),
+                        size = att.intOrNull("size")
                     )
                 }
             }
@@ -64,18 +73,11 @@ data class Message(
 
             val replyTo = json.optJSONObject("replyTo")?.let { fromJson(it) }
 
-            val metadata = json.optJSONObject("metadata")?.let { obj ->
-                val map = mutableMapOf<String, String>()
-                obj.keys().forEach { key -> map[key] = obj.optString(key) }
-                map
-            }
+            val metadata = json.optJSONObject("metadata")?.stringMap()
 
             val editHistory = json.optJSONArray("editHistory")?.let { arr ->
                 (0 until arr.length()).map { i ->
-                    val entry = arr.getJSONObject(i)
-                    val map = mutableMapOf<String, String>()
-                    entry.keys().forEach { key -> map[key] = entry.optString(key) }
-                    map
+                    arr.getJSONObject(i).stringMap()
                 }
             }
 
@@ -83,21 +85,22 @@ data class Message(
                 id = json.getString("id"),
                 roomId = json.getString("roomId"),
                 senderUserId = json.getString("senderUserId"),
-                content = json.optString("content", ""),
-                type = MessageType.valueOf(json.optString("type", "text").uppercase()),
+                content = json.stringOr("content", ""),
+                type = MessageType.valueOf(json.stringOr("type", "text").uppercase()),
                 attachments = attachments,
                 metadata = metadata,
-                replyToId = json.optString("replyToId", null),
+                replyToId = json.stringOrNull("replyToId"),
                 replyTo = replyTo,
                 isDeleted = json.optBoolean("isDeleted", false),
                 createdAt = json.getString("createdAt"),
                 isEdited = json.optBoolean("isEdited", false),
-                editedAt = json.optString("editedAt", null),
+                editedAt = json.stringOrNull("editedAt"),
                 editHistory = editHistory,
                 isPinned = json.optBoolean("isPinned", false),
-                pinnedAt = json.optString("pinnedAt", null),
-                pinnedBy = json.optString("pinnedBy", null),
-                reactions = reactions
+                pinnedAt = json.stringOrNull("pinnedAt"),
+                pinnedBy = json.stringOrNull("pinnedBy"),
+                reactions = reactions,
+                clientMessageId = json.stringOrNull("clientMessageId")
             )
         }
     }

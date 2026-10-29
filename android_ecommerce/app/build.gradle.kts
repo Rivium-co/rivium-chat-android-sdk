@@ -1,8 +1,20 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+// Your project's public key, read from local.properties (gitignored) so it is
+// never committed. See local.properties.example.
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) file.inputStream().use { load(it) }
+}
+val riviumApiKey: String = localProperties.getProperty("RIVIUM_API_KEY")
+    ?: (project.findProperty("RIVIUM_API_KEY") as String?)
+    ?: ""
 
 android {
     namespace = "co.rivium.chat.example.ecommerce"
@@ -19,6 +31,8 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+
+        buildConfigField("String", "RIVIUM_API_KEY", "\"$riviumApiKey\"")
     }
 
     buildTypes {
@@ -42,6 +56,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
 

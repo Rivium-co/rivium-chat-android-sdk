@@ -1,0 +1,6 @@
+# Copy the line below into local.properties (next to this file) and fill in
+# your key. local.properties is gitignored: never commit it.
+
+# Your project's public key (rv_live_...) from https://console.rivium.co,
+# used by Rivium Chat and Rivium Push in this example.
+RIVIUM_API_KEY=rv_live_your_api_key
